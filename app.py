@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
 
 from core import (APP_VERSION, CACHE_SCHEMA, DATA, Settings, ModError, scan, installed_versions, check_updates,
     apply_cache, write_json, Nexus, InstallPlan, mutation_lock, backup_list, restore_backup,
-    ModStatePlan, state_companions, validate_game, ensure_stopped, discover_games)
+    ModStatePlan, ModGroups, ModGroupPlan, resolve_group_members, state_companions,
+    validate_game, ensure_stopped, discover_games)
 
 STYLE = """
 * { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; color: #253d35; }
@@ -318,6 +319,129 @@ class BackupDialog(QDialog):
         self.owner.run_job(run, self.owner.after_install, "正在恢复备份 …")
 
 
+class GroupEditor(QDialog):
+    """Edit local membership; no MOD files change until a separate apply action."""
+    def __init__(self, owner, group=None, members=None):
+        super().__init__(owner)
+        self.owner, self.group = owner, group
+        self.saved_identifier, self.deleted = None, False
+        self.setWindowTitle("编辑自定义编组" if group else "新建自定义编组")
+        self.resize(800, 650)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label("为不同存档、玩法或联机组合保存 MOD 名单", "title"))
+        self.name = QLineEdit(group["name"] if group else "")
+        self.name.setPlaceholderText("编组名称，例如：休闲种田 / 联机 / 大型扩展")
+        self.name.setMaxLength(60)
+        layout.addWidget(self.name)
+        note = label("这里编辑的是编组名单，保存、复制或删除编组都不会改变实际启用状态。", "subtitle")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        tools = QHBoxLayout()
+        for text, fn in [("使用已选 MOD", lambda: self.set_members([m.uid for m in owner.selected_mods()])),
+                         ("使用当前已启用", lambda: self.set_members([m.uid for m in owner.mods if not m.disabled])),
+                         ("补齐必需前置", self.add_dependencies), ("清空名单", lambda: self.set_members([]))]:
+            tools.addWidget(button(text, fn))
+        layout.addLayout(tools)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索名称或 UniqueID，勾选要加入编组的 MOD …")
+        self.search.setClearButtonEnabled(True)
+        layout.addWidget(self.search)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["加入", "MOD / 组件", "UniqueID"])
+        self.table.setColumnWidth(0, 52)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().hide()
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table, 1)
+        saved = group["members"] if group else list(members or [])
+        by_id = {}
+        for mod in owner.mods:
+            by_id.setdefault(mod.uid.casefold(), []).append(mod)
+        catalog = {uid: (rows[0].uid, rows[0].name + ("（重复 ID）" if len(rows) > 1 else ""))
+                   for uid, rows in by_id.items()}
+        for uid in saved:
+            catalog.setdefault(uid.casefold(), (uid, "未安装 · " + uid))
+        self.rows = sorted(catalog.values(), key=lambda row: row[1].casefold())
+        self.table.setRowCount(len(self.rows))
+        for row, (uid, title) in enumerate(self.rows):
+            item = QTableWidgetItem()
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.table.setItem(row, 0, item)
+            self.table.setItem(row, 1, QTableWidgetItem(title))
+            self.table.setItem(row, 2, QTableWidgetItem(uid))
+        self.count = label("", "muted")
+        layout.addWidget(self.count)
+        self.table.itemChanged.connect(self.update_count)
+        self.search.textChanged.connect(self.filter_rows)
+        self.set_members(saved)
+        actions = QHBoxLayout()
+        if group:
+            actions.addWidget(button("删除编组", self.delete_group))
+            actions.addWidget(button("另存为新编组", lambda: self.save_group(copy=True)))
+        actions.addStretch()
+        actions.addWidget(button("取消", self.reject))
+        actions.addWidget(button("保存编组", self.save_group, True))
+        layout.addLayout(actions)
+
+    def members(self):
+        return [uid for row, (uid, _) in enumerate(self.rows)
+                if self.table.item(row, 0).checkState() == Qt.CheckState.Checked]
+
+    def set_members(self, members):
+        selected = {uid.casefold() for uid in members}
+        self.table.blockSignals(True)
+        for row, (uid, _) in enumerate(self.rows):
+            self.table.item(row, 0).setCheckState(Qt.CheckState.Checked if uid.casefold() in selected else Qt.CheckState.Unchecked)
+        self.table.blockSignals(False)
+        self.update_count()
+
+    def update_count(self):
+        self.count.setText(f"编组中有 {len(self.members())} 个 MOD ID。缺失项会保留，可取消勾选移除。")
+
+    def filter_rows(self):
+        needle = self.search.text().strip().casefold()
+        for row, (uid, title) in enumerate(self.rows):
+            self.table.setRowHidden(row, needle not in (uid + " " + title).casefold())
+
+    def add_dependencies(self):
+        try:
+            resolved = resolve_group_members(self.members(), self.owner.mods)
+            self.set_members([mod.uid for mod in resolved])
+        except Exception as exc:
+            QMessageBox.warning(self, "无法补齐前置", str(exc))
+
+    def save_group(self, checked=False, copy=False):
+        try:
+            identifier = self.group["id"] if self.group and not copy else None
+            name = self.owner.group_store.valid_name(self.name.text())
+            if copy:
+                used = {group["name"].casefold() for group in self.owner.group_store.groups}
+                original, index = name, 1
+                while name.casefold() in used:
+                    suffix = " 副本" + (f" {index}" if index > 1 else "")
+                    name = original[:60 - len(suffix)] + suffix
+                    index += 1
+            saved = self.owner.group_store.save(name, self.members(), identifier)
+            self.saved_identifier = saved["id"]
+            self.accept()
+        except Exception as exc:
+            QMessageBox.warning(self, "无法保存编组", str(exc))
+
+    def delete_group(self):
+        box = QMessageBox.question(self, "删除编组", "删除「" + self.group["name"] + "」？只删除名单，MOD 文件和启用状态保持原样。",
+                                  QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                                  QMessageBox.StandardButton.Cancel)
+        if box == QMessageBox.StandardButton.Yes:
+            try:
+                self.owner.group_store.delete(self.group["id"])
+                self.deleted = True
+                self.accept()
+            except Exception as exc:
+                QMessageBox.warning(self, "无法删除编组", str(exc))
+
+
 class Window(QMainWindow):
     def __init__(self, settings):
         super().__init__()
@@ -326,13 +450,15 @@ class Window(QMainWindow):
         self.mods = []
         self.cache = {}
         self.filter_name = "all"
+        self.group_store = None
+        self.group_id = None
         self.busy = False
         self.jobs = set()
         self.actions = []
         self.setWindowTitle("星露谷 MOD 管家")
         self.setWindowIcon(make_icon())
-        self.resize(1320, 860)
-        self.setMinimumSize(1080, 720)
+        self.resize(1420, 960)
+        self.setMinimumSize(1180, 800)
         self.setAcceptDrops(True)
         self.build()
         self.refresh()
@@ -411,6 +537,26 @@ class Window(QMainWindow):
             self.counts.append(n)
             cards.addWidget(card)
         body.addLayout(cards)
+        groupbar = QHBoxLayout()
+        groupbar.addWidget(label("自定义编组", "subtitle"))
+        self.group_combo = QComboBox()
+        self.group_combo.setMinimumWidth(190)
+        self.group_combo.setMaximumWidth(260)
+        self.group_combo.addItem("全部 MOD（未筛选编组）", None)
+        self.group_combo.currentIndexChanged.connect(self.group_changed)
+        groupbar.addWidget(self.group_combo, 1)
+        self.group_new = button("新建编组", lambda: self.edit_group(new=True))
+        self.group_edit = button("编辑 / 复制", self.edit_group)
+        self.group_enable = button("启用整组", lambda: self.change_group_state(True))
+        self.group_disable = button("禁用整组", lambda: self.change_group_state(False))
+        self.group_apply = button("应用为方案", self.apply_group, True)
+        for item in (self.group_new, self.group_edit, self.group_enable, self.group_disable, self.group_apply):
+            groupbar.addWidget(item)
+        self.actions.extend([self.group_combo, self.group_new, self.group_edit, self.group_enable, self.group_disable, self.group_apply])
+        body.addLayout(groupbar)
+        self.group_hint = label("选择编组只筛选列表；应用为方案会仅启用该组及必需前置。", "muted")
+        self.group_hint.setWordWrap(True)
+        body.addWidget(self.group_hint)
         bar = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索名称、作者或 UniqueID …")
@@ -426,12 +572,20 @@ class Window(QMainWindow):
             self.actions.append(b)
         body.addLayout(bar)
         states = QHBoxLayout()
-        states.addWidget(label("启用状态", "subtitle"))
+        self.select_all = button("全选列表", self.select_visible)
+        self.invert_selection = button("反选", lambda: self.select_visible(invert=True))
+        states.addWidget(self.select_all)
+        states.addWidget(self.invert_selection)
         self.enable_selected = button("启用选中", lambda: self.change_state(True))
         self.disable_selected = button("禁用选中", lambda: self.change_state(False))
         states.addWidget(self.enable_selected)
         states.addWidget(self.disable_selected)
-        self.actions.extend([self.enable_selected, self.disable_selected])
+        self.group_add = button("加入编组", self.add_to_group)
+        self.group_remove = button("移出编组", self.remove_from_group)
+        states.addWidget(self.group_add)
+        states.addWidget(self.group_remove)
+        self.actions.extend([self.select_all, self.invert_selection, self.enable_selected, self.disable_selected,
+                             self.group_add, self.group_remove])
         self.selection_label = label("勾选左侧状态可单独切换；Ctrl / Shift 可多选", "muted")
         states.addWidget(self.selection_label, 1)
         body.addLayout(states)
@@ -509,6 +663,12 @@ class Window(QMainWindow):
         try:
             self.game = self.settings.values["game"]
             self.mods, errors = scan(self.game)
+            try:
+                self.group_store = ModGroups(self.game, self.settings.data)
+            except Exception as exc:
+                self.group_store = None
+                self.log(str(exc))
+            self.reload_groups()
             cache_path = DATA / "updates.json"
             try:
                 self.cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
@@ -546,6 +706,158 @@ class Window(QMainWindow):
             b.setChecked(k == key)
         self.populate()
 
+    def current_group(self):
+        return self.group_store.get(self.group_id) if self.group_store else None
+
+    def reload_groups(self, selected=None):
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem("全部 MOD（未筛选编组）", None)
+        if self.group_store:
+            selections = self.settings.values.get("group_selection", {})
+            wanted = selected if selected is not None else selections.get(self.group_store.key) if isinstance(selections, dict) else None
+            for group in self.group_store.groups:
+                self.group_combo.addItem(f"{group['name']}  ({len(group['members'])})", group["id"])
+            index = self.group_combo.findData(wanted)
+            self.group_combo.setCurrentIndex(max(0, index))
+        self.group_id = self.group_combo.currentData()
+        self.group_combo.blockSignals(False)
+
+    def remember_group(self):
+        if self.group_store:
+            selections = self.settings.values.get("group_selection")
+            if not isinstance(selections, dict):
+                selections = {}
+                self.settings.values["group_selection"] = selections
+            selections[self.group_store.key] = self.group_id
+            self.settings.save()
+
+    def group_changed(self):
+        self.group_id = self.group_combo.currentData()
+        try:
+            self.remember_group()
+        except Exception as exc:
+            self.log("无法记住编组筛选：" + str(exc))
+        self.populate()
+
+    def update_group_controls(self):
+        group = self.current_group()
+        can_edit = self.group_store is not None and not self.busy
+        self.group_combo.setEnabled(can_edit)
+        self.group_new.setEnabled(can_edit)
+        self.group_edit.setEnabled(can_edit and group is not None)
+        self.group_apply.setEnabled(can_edit and group is not None)
+        members = {uid.casefold() for uid in group["members"]} if group else set()
+        rows = [mod for mod in self.mods if mod.uid.casefold() in members]
+        self.group_enable.setEnabled(can_edit and any(mod.disabled for mod in rows))
+        self.group_disable.setEnabled(can_edit and any(not mod.disabled for mod in rows))
+        selected = self.selected_mods()
+        self.group_add.setEnabled(can_edit and bool(selected))
+        self.group_remove.setEnabled(can_edit and bool(selected) and group is not None)
+        self.select_all.setEnabled(not self.busy and bool(getattr(self, "visible", [])))
+        self.invert_selection.setEnabled(self.select_all.isEnabled())
+        if not self.group_store:
+            self.group_hint.setText("自定义编组暂不可用，原编组文件未改动；请查看下方操作记录。")
+        elif group:
+            found = {mod.uid.casefold() for mod in rows}
+            missing = len(members - found)
+            self.group_hint.setText(f"{group['name']} · {len(members)} 个 MOD ID，{missing} 个未安装。选择编组只筛选；应用为方案会启用该组及必需前置，并禁用组外 MOD。")
+        else:
+            self.group_hint.setText("选择编组只筛选列表；整组启停按组内名单操作，应用为方案会仅启用该组及必需前置。")
+
+    def select_visible(self, checked=False, invert=False):
+        if self.busy:
+            return
+        selected = {index.row() for index in self.table.selectionModel().selectedRows()}
+        self.table.clearSelection()
+        for row in range(self.table.rowCount()):
+            if not invert or row not in selected:
+                self.table.selectionModel().select(self.table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        self.show_details()
+
+    def edit_group(self, checked=False, new=False, members=None):
+        if self.busy or not self.group_store:
+            return
+        group = None if new else self.current_group()
+        if not new and group is None:
+            return
+        dialog = GroupEditor(self, group, members)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.reload_groups(dialog.saved_identifier if not dialog.deleted else "")
+            self.remember_group()
+            self.populate()
+            self.log("已删除编组，MOD 启用状态保持原样。" if dialog.deleted else "已保存编组名单；应用为方案后才会切换实际启用状态。")
+
+    def add_to_group(self):
+        if self.busy or not self.group_store:
+            return
+        selected = self.selected_mods()
+        if not selected:
+            return
+        group = self.current_group()
+        if group is None:
+            self.edit_group(new=True, members=[mod.uid for mod in selected])
+            return
+        try:
+            self.group_store.save(group["name"], group["members"] + [mod.uid for mod in selected], group["id"])
+            self.reload_groups(group["id"])
+            self.populate()
+            self.log("已将选中 MOD 加入编组，实际启用状态保持原样。")
+        except Exception as exc:
+            self.failed(str(exc))
+
+    def remove_from_group(self):
+        group = self.current_group()
+        if self.busy or not self.group_store or not group:
+            return
+        removed = {mod.uid.casefold() for mod in self.selected_mods()}
+        try:
+            self.group_store.save(group["name"], [uid for uid in group["members"] if uid.casefold() not in removed], group["id"])
+            self.reload_groups(group["id"])
+            self.populate()
+            self.log("已从编组移出选中 MOD，实际启用状态保持原样。")
+        except Exception as exc:
+            self.failed(str(exc))
+
+    def change_group_state(self, enabled):
+        group = self.current_group()
+        if group and not self.busy:
+            members = {uid.casefold() for uid in group["members"]}
+            self.change_state(enabled, [mod for mod in self.mods if mod.uid.casefold() in members])
+
+    def apply_group(self):
+        group = self.current_group()
+        if not group or self.busy:
+            return
+        try:
+            plan = ModGroupPlan(self.game, group["members"])
+        except Exception as exc:
+            self.failed(str(exc))
+            return
+        if not plan.items:
+            QMessageBox.information(self, "无需更改", "当前启用状态已与此编组及其必需前置一致。")
+            return
+        enabling = sum(entry["enabled"] for entry in plan.items)
+        box = QMessageBox(self)
+        box.setWindowTitle("应用编组方案")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"应用「{group['name']}」：启用 {enabling} 项，禁用 {len(plan.items) - enabling} 项？")
+        extra = "\n自动包含必需前置：" + "、".join(mod.name for mod in plan.dependencies) if plan.dependencies else ""
+        empty = "\n这是空编组，将禁用所有 MOD。" if not group["members"] else ""
+        box.setInformativeText("仅启用编组中的 MOD 及必需前置；组外 MOD 将被禁用。保存编组不会修改存档，已有存档可能依赖这些 MOD。" + empty + extra + "\n\n" + plan.summary()[:1800])
+        box.setDetailedText(plan.summary())
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        box.button(QMessageBox.StandardButton.Yes).setText("应用方案并备份")
+        box.button(QMessageBox.StandardButton.Cancel).setText("取消")
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            name = group["name"]
+            def finished(folder):
+                self.after_state_change(folder)
+                self.log("已应用编组「" + name + "」及必需前置；可在「备份与恢复」撤销。")
+            self.run_job(lambda log: plan.execute(log), finished, "正在应用编组「" + name + "」…")
+
     def populate(self):
         selected = self.selected()
         selected_path = selected.path if selected else None
@@ -565,6 +877,10 @@ class Window(QMainWindow):
             self.nav[key].setText(f"{text}    {count}")
         needle = self.search.text().strip().casefold()
         visible = [m for m in self.mods if needle in f"{m.name} {m.author} {m.uid}".casefold()]
+        group = self.current_group()
+        if group:
+            members = {uid.casefold() for uid in group["members"]}
+            visible = [m for m in visible if m.uid.casefold() in members]
         if self.filter_name == "updates":
             visible = [m for m in visible if m.suggestion]
         elif self.filter_name == "issues":
@@ -625,7 +941,8 @@ class Window(QMainWindow):
         self.enable_selected.setEnabled(not self.busy and any(mod.disabled for mod in chosen))
         self.disable_selected.setEnabled(not self.busy and any(not mod.disabled for mod in chosen))
         self.toggle_button.setEnabled(not self.busy and m is not None)
-        self.selection_label.setText(f"已选 {len(chosen)} 项 · 勾选状态可单独切换，Ctrl / Shift 可多选")
+        self.selection_label.setText(f"已选 {len(chosen)} 项 / 列表 {len(getattr(self, 'visible', []))} 项 · Ctrl / Shift 多选")
+        self.update_group_controls()
         if not m:
             self.detail.setHtml("<h3>选择一个 MOD</h3><p>查看版本、来源和依赖关系。</p>")
             return

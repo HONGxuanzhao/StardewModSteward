@@ -21,7 +21,7 @@ from contextlib import contextmanager
 
 import requests
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 CACHE_SCHEMA = 2
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "StardewModSteward"
 HTTP_HEADERS = {"User-Agent": f"StardewModSteward/{APP_VERSION}", "Accept": "application/json"}
@@ -311,6 +311,108 @@ class Settings:
 
     def set_key(self, key):
         self.values["nexus_key"] = protect_key(key.strip())
+
+
+class ModGroups:
+    """Per-installation, UID-based collections. Saving a group never moves a MOD."""
+    def __init__(self, game, data=DATA):
+        self.game = str(validate_game(game))
+        self.path = Path(data) / "groups.json"
+        self.key = os.path.normcase(os.path.abspath(self.game))
+        self.document = {"schema": 1, "games": {}}
+        try:
+            checked_path(self.path.parent, self.path)
+            if self.path.exists():
+                self.document = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            if not isinstance(self.document, dict) or self.document.get("schema") != 1 or not isinstance(self.document.get("games"), dict):
+                raise ValueError()
+            self.record = self.document["games"].setdefault(self.key, {"game": self.game, "groups": []})
+            if not isinstance(self.record, dict) or not isinstance(self.record.get("groups"), list):
+                raise ValueError()
+            names, identifiers = set(), set()
+            for group in self.record["groups"]:
+                if not isinstance(group, dict) or not isinstance(group.get("id"), str) or not group["id"]:
+                    raise ValueError()
+                name = self.valid_name(group.get("name"))
+                members = group.get("members")
+                if group["id"] in identifiers or name.casefold() in names or not isinstance(members, list):
+                    raise ValueError()
+                self.valid_members(members)
+                names.add(name.casefold())
+                identifiers.add(group["id"])
+        except (OSError, ValueError, KeyError, TypeError, ModError) as exc:
+            raise ModError("无法读取自定义编组，原文件未改动。请核对或从备份恢复：" + str(self.path)) from exc
+
+    @staticmethod
+    def valid_name(name):
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 60:
+            raise ModError("编组名称需为 1–60 个字符。")
+        return name.strip()
+
+    @staticmethod
+    def valid_members(members):
+        if isinstance(members, (str, bytes)) or not isinstance(members, (list, tuple, set)):
+            raise ModError("编组成员格式无效。")
+        result, seen = [], set()
+        for uid in members:
+            if not isinstance(uid, str) or not uid.strip() or len(uid) > 256:
+                raise ModError("编组包含无效的 MOD ID。")
+            uid = uid.strip()
+            if uid.casefold() not in seen:
+                result.append(uid)
+                seen.add(uid.casefold())
+        return result
+
+    @property
+    def groups(self):
+        return self.record["groups"]
+
+    def get(self, identifier):
+        return next((group for group in self.groups if group["id"] == identifier), None)
+
+    def save(self, name, members, identifier=None):
+        name, members = self.valid_name(name), self.valid_members(members)
+        if any(g["name"].casefold() == name.casefold() and g["id"] != identifier for g in self.groups):
+            raise ModError("已有同名编组，请使用不同名称。")
+        if identifier is not None and self.get(identifier) is None:
+            raise ModError("此编组已不存在，请刷新后重试。")
+        group = dict(id=identifier or uuid.uuid4().hex, name=name, members=members)
+        previous = list(self.groups)
+        self.record["groups"] = [group if g["id"] == identifier else g for g in previous]
+        if identifier is None:
+            self.record["groups"].append(group)
+        try:
+            self._write()
+        except BaseException:
+            self.record["groups"] = previous
+            raise
+        return group
+
+    def delete(self, identifier):
+        if self.get(identifier) is None:
+            raise ModError("此编组已不存在。")
+        previous = list(self.groups)
+        self.record["groups"] = [g for g in previous if g["id"] != identifier]
+        try:
+            self._write()
+        except BaseException:
+            self.record["groups"] = previous
+            raise
+
+    def _write(self):
+        # Preserve the preceding group document for recoverable metadata edits.
+        checked_path(self.path.parent, self.path)
+        if self.path.exists():
+            backup = self.path.with_name("groups.previous.json")
+            checked_path(self.path.parent, backup)
+            checked_path(self.path.parent, self.path)
+            current = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            if not isinstance(current, dict) or current.get("schema") != 1 or not isinstance(current.get("games"), dict):
+                raise ModError("编组文件在编辑期间发生变化，请重新打开。")
+            write_json(backup, current)
+            current["games"][self.key] = self.record
+            self.document = current
+        write_json(self.path, self.document)
 
 
 @dataclass
@@ -1050,7 +1152,7 @@ def backup_list(game):
                 result.append(row)
             except (OSError, ValueError):
                 pass
-    return result
+    return sorted(result, key=lambda row: row.get("time", 0), reverse=True)
 
 
 def ensure_no_pending(game):
@@ -1245,32 +1347,38 @@ class ModStatePlan:
         self.game = validate_game(game)
         ensure_stopped()
         ensure_no_pending(self.game)
-        self.enabled = bool(enabled)
+        # None means each requested item is a (Mod, desired_enabled) pair.
+        self.enabled = bool(enabled) if enabled is not None else None
         self.requested = list(requested)
+        targets = [(mod, self.enabled) for mod in self.requested] if enabled is not None else self.requested
         self.items = []
         mods, errors = scan(self.game)
         if errors:
             raise ModError("有清单读取错误，请先修复后操作：" + errors[0])
         disabled = self.game / ".stardew-mod-steward" / "disabled"
         checked_path(self.game, disabled)
-        seen = set()
-        for old in self.requested:
+        seen = {}
+        for old, wanted in targets:
+            if not isinstance(wanted, bool):
+                raise ModError("启用状态必须是布尔值。")
             key = str(old.path).casefold()
             if key in seen:
+                if seen[key] != wanted:
+                    raise ModError("同一个 MOD 不能同时启用和禁用。")
                 continue
-            seen.add(key)
+            seen[key] = wanted
             mod = next((m for m in mods if m.path == old.path and m.uid.casefold() == old.uid.casefold()
                         and m.version == old.version), None)
             if mod is None or mod.disabled != old.disabled:
                 raise ModError("列表状态已改变，请刷新后重试：" + old.name)
-            if (not mod.disabled) == self.enabled:
+            if (not mod.disabled) == wanted:
                 continue
             assert_plain_tree(mod.path)
             if any(other.path != mod.path and (mod.path in other.path.parents or other.path in mod.path.parents)
                    for other in mods):
                 raise ModError("此 MOD 与其他 MOD 目录嵌套，请先整理独立目录：" + mod.name)
             marker = mod.path / ".steward-disabled.json"
-            if self.enabled:
+            if wanted:
                 try:
                     checked_path(disabled, mod.path)
                 except ModError:
@@ -1298,7 +1406,7 @@ class ModStatePlan:
             if target.exists():
                 raise ModError("目标目录已存在，未覆盖任何文件：" + str(target))
             entry = dict(name=mod.name, uid=mod.uid, version=mod.version, source=str(mod.path.relative_to(self.game)),
-                         destination=str(target.relative_to(self.game)), enabled=self.enabled,
+                         destination=str(target.relative_to(self.game)), enabled=wanted,
                          marker_before=base64.b64encode(before).decode("ascii") if before is not None else None,
                          marker_after=after)
             _state_paths(self.game, entry)
@@ -1309,15 +1417,16 @@ class ModStatePlan:
         changed_paths = {str(self.game / e["source"]).casefold() for e in self.items}
         changed_ids = {e["uid"].casefold() for e in self.items}
         changing = [m for m in mods if str(m.path).casefold() in changed_paths]
+        enabling_paths = {str(self.game / e["source"]).casefold() for e in self.items if e["enabled"]}
+        enabling = [m for m in changing if str(m.path).casefold() in enabling_paths]
         future = [m for m in mods if not m.disabled and str(m.path).casefold() not in changed_paths]
-        if self.enabled:
-            future.extend(changing)
+        future.extend(enabling)
         by_id = {}
         for mod in future:
             by_id.setdefault(mod.uid.casefold(), []).append(mod)
         problems = []
         api, _ = installed_versions(self.game)
-        for mod in changing if self.enabled else []:
+        for mod in enabling:
             if len(by_id.get(mod.uid.casefold(), [])) > 1:
                 problems.append(mod.name + "：已有相同 UniqueID 的启用 MOD。")
             minimum = mod.manifest.get("MinimumApiVersion")
@@ -1336,12 +1445,11 @@ class ModStatePlan:
                                                           for m in candidates):
                     problems.append(f"{mod.name}：前置 {dep['UniqueID']} 需要版本 {dep['MinimumVersion']}。")
         if problems:
-            action = "启用" if self.enabled else "禁用"
+            action = "切换方案" if self.enabled is None else "启用" if self.enabled else "禁用"
             raise ModError("无法" + action + "所选 MOD，请将需要同时调整的前置和依赖者一起选择：\n" + "\n".join(dict.fromkeys(problems)))
 
     def summary(self):
-        action = "启用" if self.enabled else "禁用"
-        return "\n".join(f"{action}  {e['name']}  ({e['uid']})" for e in self.items)
+        return "\n".join(f"{'启用' if e['enabled'] else '禁用'}  {e['name']}  ({e['uid']})" for e in self.items)
 
     def execute(self, log=lambda _: None):
         with mutation_lock(self.game):
@@ -1355,7 +1463,7 @@ class ModStatePlan:
         state = self.game / ".stardew-mod-steward"
         folder = checked_path(state, state / "backups" / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]))
         folder.mkdir(parents=True)
-        journal = dict(kind="mod_state", action="启用" if self.enabled else "禁用", state="prepared",
+        journal = dict(kind="mod_state", action="切换方案" if self.enabled is None else "启用" if self.enabled else "禁用", state="prepared",
                        game=str(self.game), time=time.time(), enabled=self.enabled, entries=self.items)
         path = folder / "transaction.json"
         write_json(path, journal)
@@ -1370,7 +1478,7 @@ class ModStatePlan:
                 os.replace(source, destination)
                 _state_marker(destination, entry["marker_after"])
                 write_json(path, journal)
-                log(("已启用：" if self.enabled else "已禁用：") + entry["name"])
+                log(("已启用：" if entry["enabled"] else "已禁用：") + entry["name"])
             journal["state"] = "complete"
             write_json(path, journal)
             return folder
@@ -1403,13 +1511,76 @@ def _restore_mod_state(game, folder, journal, log):
         mod = next((m for m in mods if m.path == current and m.uid.casefold() == entry["uid"].casefold()), None)
         if mod is None:
             raise ModError("找不到该启停批次对应的 MOD：" + entry["name"])
-        selected.append(mod)
-    plan = ModStatePlan(game, selected, not journal["enabled"])
+        selected.append((mod, not entry["enabled"]))
+    if journal["enabled"] is None:
+        plan = ModStatePlan(game, selected, None)
+    else:
+        plan = ModStatePlan(game, [mod for mod, _ in selected], not journal["enabled"])
     result = plan._execute_locked(log)
     journal["state"] = "restored"
     journal["restore_time"] = time.time()
     write_json(folder / "transaction.json", journal)
     return result or folder
+
+
+def resolve_group_members(members, mods):
+    """Expand required dependencies without guessing between duplicate IDs."""
+    wanted = ModGroups.valid_members(members)
+    by_id = {}
+    for mod in mods:
+        by_id.setdefault(mod.uid.casefold(), []).append(mod)
+    resolved, queue = {}, list(wanted)
+    while queue:
+        uid = queue.pop(0)
+        if uid.casefold() in resolved:
+            continue
+        candidates = by_id.get(uid.casefold(), [])
+        if not candidates:
+            raise ModError("编组需要的 MOD 未安装，请安装或编辑编组移除此项：" + uid)
+        if len(candidates) != 1:
+            raise ModError("编组中有重复 UniqueID，无法确定使用哪份，请先整理：" + uid)
+        mod = candidates[0]
+        resolved[uid.casefold()] = mod
+        queue.extend(dep.get("UniqueID", "") for dep in required_dependencies(mod))
+    return sorted(resolved.values(), key=lambda mod: mod.name.casefold())
+
+
+class ModGroupPlan:
+    """An exact enabled set plus required dependencies, applied in one transaction."""
+    def __init__(self, game, members):
+        self.game = validate_game(game)
+        self.members = ModGroups.valid_members(members)
+        ensure_stopped()
+        mods, errors = scan(self.game)
+        if errors:
+            raise ModError("有清单读取错误，请先修复后应用编组：" + errors[0])
+        self.resolved = resolve_group_members(self.members, mods)
+        api, _ = installed_versions(self.game)
+        for mod in self.resolved:
+            minimum = mod.manifest.get("MinimumApiVersion")
+            if minimum and compare_versions(api, str(minimum)) == -1:
+                raise ModError(f"{mod.name}：需要 SMAPI {minimum}。")
+            for dep in required_dependencies(mod):
+                host = next(other for other in self.resolved if other.uid.casefold() == dep.get("UniqueID", "").casefold())
+                if dep.get("MinimumVersion") and compare_versions(host.version, str(dep["MinimumVersion"])) == -1:
+                    raise ModError(f"{mod.name}：前置 {host.uid} 需要版本 {dep['MinimumVersion']}。")
+        original = {uid.casefold() for uid in self.members}
+        self.dependencies = [mod for mod in self.resolved if mod.uid.casefold() not in original]
+        desired = {mod.uid.casefold() for mod in self.resolved}
+        self.plan = ModStatePlan(self.game, [(mod, mod.uid.casefold() in desired) for mod in mods], None)
+        self.items = self.plan.items
+        self.snapshot = sorted((str(mod.path).casefold(), mod.uid.casefold(), mod.version, mod.disabled,
+                                json.dumps(mod.manifest, sort_keys=True, ensure_ascii=False)) for mod in mods)
+
+    def summary(self):
+        return self.plan.summary()
+
+    def execute(self, log=lambda _: None):
+        with mutation_lock(self.game):
+            current = ModGroupPlan(self.game, self.members)
+            if current.snapshot != self.snapshot:
+                raise ModError("MOD 列表在预览后发生变化，请刷新并重新确认编组方案。")
+            return current.plan._execute_locked(log)
 
 
 def toggle_mod(game, mod):

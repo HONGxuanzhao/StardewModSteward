@@ -237,6 +237,181 @@ class UiTests(unittest.TestCase):
         job.assert_not_called()
         failed.assert_called_once()
 
+    def group_fixture(self):
+        for uid in ("Test.Second", "Test.Third"):
+            folder = self.game / "Mods" / uid
+            folder.mkdir()
+            core.write_json(folder / "manifest.json", dict(Name=uid, UniqueID=uid, Version="1.0.0"))
+        self.window.refresh()
+        group = self.window.group_store.save("种田", ["Test.Example", "Test.Second"])
+        self.window.reload_groups(group["id"])
+        self.window.group_changed()
+        return group
+
+    def test_visible_select_all_and_invert_do_not_toggle_enabled_flags(self):
+        self.group_fixture()
+        self.window.select_all.click()
+        self.assertEqual(len(self.window.selected_mods()), 2)
+        self.window.invert_selection.click()
+        self.assertEqual(self.window.selected_mods(), [])
+        self.window.invert_selection.click()
+        self.assertEqual(len(self.window.selected_mods()), 2)
+        self.assertFalse(any(mod.disabled for mod in core.scan(self.game)[0]))
+
+    def test_select_all_respects_group_and_search(self):
+        self.group_fixture()
+        self.window.search.setText("Second")
+        self.window.select_all.click()
+        self.assertEqual([mod.uid for mod in self.window.selected_mods()], ["Test.Second"])
+
+    def test_group_filter_composes_with_state_filter_and_search(self):
+        self.group_fixture()
+        self.assertEqual({mod.uid for mod in self.window.visible}, {"Test.Example", "Test.Second"})
+        core.ModStatePlan(self.game, [mod for mod in self.window.mods if mod.uid == "Test.Second"], False).execute()
+        self.window.refresh()
+        self.window.set_filter("disabled")
+        self.assertEqual([mod.uid for mod in self.window.visible], ["Test.Second"])
+        self.window.search.setText("Third")
+        self.assertEqual(self.window.table.rowCount(), 0)
+
+    def test_group_selection_is_remembered_after_refresh(self):
+        group = self.group_fixture()
+        self.window.refresh()
+        self.assertEqual(self.window.group_combo.currentData(), group["id"])
+        saved = core.json.loads(self.window.settings.path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["group_selection"][self.window.group_store.key], group["id"])
+
+    def test_switching_group_view_never_moves_mod_files(self):
+        self.group_fixture()
+        before = {str(mod.path) for mod in core.scan(self.game)[0]}
+        self.window.group_combo.setCurrentIndex(0)
+        self.assertEqual(self.window.table.rowCount(), 3)
+        self.window.group_combo.setCurrentIndex(1)
+        self.assertEqual(self.window.table.rowCount(), 2)
+        self.assertEqual({str(mod.path) for mod in core.scan(self.game)[0]}, before)
+
+    def test_add_and_remove_group_members_only_edits_metadata(self):
+        group = self.group_fixture()
+        self.window.group_combo.setCurrentIndex(0)
+        self.window.select_visible()
+        self.window.group_id = group["id"]
+        self.window.add_to_group()
+        self.assertEqual(len(self.window.current_group()["members"]), 3)
+        self.window.search.setText("Third")
+        self.window.select_visible()
+        self.window.remove_from_group()
+        self.assertEqual(set(self.window.current_group()["members"]), {"Test.Example", "Test.Second"})
+        self.assertTrue(all(not mod.disabled for mod in core.scan(self.game)[0]))
+
+    def test_group_disable_targets_whole_group_even_when_search_hides_members(self):
+        self.group_fixture()
+        self.window.search.setText("Second")
+        with patch.object(self.window, "change_state") as change:
+            self.window.group_disable.click()
+        enabled, members = change.call_args.args
+        self.assertFalse(enabled)
+        self.assertEqual({mod.uid for mod in members}, {"Test.Example", "Test.Second"})
+
+    def test_group_apply_preview_explicitly_disables_outside_and_can_cancel(self):
+        self.group_fixture()
+        def cancel(box):
+            self.assertIn("禁用 1 项", box.text())
+            self.assertIn("组外 MOD 将被禁用", box.informativeText())
+            self.assertIn("Test.Third", box.detailedText())
+            return QMessageBox.StandardButton.Cancel
+        with patch.object(QMessageBox, "exec", cancel), patch.object(self.window, "run_job") as job:
+            self.window.apply_group()
+        job.assert_not_called()
+        self.assertTrue(all(not mod.disabled for mod in core.scan(self.game)[0]))
+
+    def test_confirmed_group_apply_uses_one_mixed_transaction(self):
+        self.group_fixture()
+        second = next(mod for mod in self.window.mods if mod.uid == "Test.Second")
+        core.ModStatePlan(self.game, [second], False).execute()
+        self.window.refresh()
+        with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Yes), \
+             patch.object(self.window, "run_job") as job:
+            self.window.apply_group()
+        folder = job.call_args.args[0](lambda _: None)
+        journal = core.json.loads((folder / "transaction.json").read_text(encoding="utf-8"))
+        self.assertIsNone(journal["enabled"])
+        self.assertEqual({entry["enabled"] for entry in journal["entries"]}, {True, False})
+        rows = {mod.uid: mod.disabled for mod in core.scan(self.game)[0]}
+        self.assertEqual(rows, {"Test.Example": False, "Test.Second": False, "Test.Third": True})
+
+    def test_group_editor_can_save_copy_and_remove_missing_members(self):
+        group = self.window.group_store.save("Original", ["Test.Example", "Missing.Mod"])
+        dialog = app.GroupEditor(self.window, group)
+        self.assertIn("Missing.Mod", dialog.members())
+        self.assertTrue(any("未安装" in title for _, title in dialog.rows))
+        dialog.set_members(["Test.Example"])
+        dialog.name.setText("Copied")
+        dialog.save_group(copy=True)
+        self.assertNotEqual(dialog.saved_identifier, group["id"])
+        self.assertEqual(self.window.group_store.get(dialog.saved_identifier)["members"], ["Test.Example"])
+        self.assertEqual(self.window.group_store.get(group["id"])["members"], ["Test.Example", "Missing.Mod"])
+        dialog.deleteLater()
+
+    def test_group_editor_duplicate_name_keeps_original_and_shows_reason(self):
+        group = self.window.group_store.save("Original", ["Test.Example"])
+        self.window.group_store.save("Taken", [])
+        dialog = app.GroupEditor(self.window, group)
+        dialog.name.setText("Taken")
+        with patch.object(QMessageBox, "warning") as warning:
+            dialog.save_group()
+        warning.assert_called_once()
+        self.assertEqual(self.window.group_store.get(group["id"])["name"], "Original")
+        dialog.reject()
+        dialog.deleteLater()
+
+    def test_copy_group_generates_an_available_name(self):
+        group = self.window.group_store.save("Original", ["Test.Example"])
+        self.window.group_store.save("Original 副本", [])
+        dialog = app.GroupEditor(self.window, group)
+        dialog.save_group(copy=True)
+        self.assertEqual(self.window.group_store.get(dialog.saved_identifier)["name"], "Original 副本 2")
+        dialog.deleteLater()
+
+    def test_delete_group_does_not_disable_its_mods(self):
+        group = self.group_fixture()
+        dialog = app.GroupEditor(self.window, group)
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+            dialog.delete_group()
+        self.assertTrue(dialog.deleted)
+        self.assertIsNone(self.window.group_store.get(group["id"]))
+        self.assertTrue(all(not mod.disabled for mod in core.scan(self.game)[0]))
+        dialog.deleteLater()
+
+    def test_empty_group_confirmation_warns_all_mods_will_be_disabled(self):
+        group = self.window.group_store.save("空组", [])
+        self.window.reload_groups(group["id"])
+        def cancel(box):
+            self.assertIn("空编组，将禁用所有 MOD", box.informativeText())
+            return QMessageBox.StandardButton.Cancel
+        with patch.object(QMessageBox, "exec", cancel), patch.object(self.window, "run_job") as job:
+            self.window.apply_group()
+        job.assert_not_called()
+
+    def test_busy_prevents_group_apply_and_membership_changes(self):
+        group = self.group_fixture()
+        self.window.busy = True
+        with patch.object(app, "ModGroupPlan") as plan:
+            self.window.apply_group()
+            self.window.remove_from_group()
+        plan.assert_not_called()
+        self.assertEqual(self.window.group_store.get(group["id"])["members"], ["Test.Example", "Test.Second"])
+        self.window.busy = False
+
+    def test_editor_add_required_dependencies_to_draft_only(self):
+        pack = self.package_pair()
+        dialog = app.GroupEditor(self.window, members=[pack.uid])
+        dialog.add_dependencies()
+        self.assertEqual(set(dialog.members()), {"Test.Pack", "Test.Code"})
+        self.assertEqual(self.window.group_store.groups, [])
+        self.assertFalse(any(mod.disabled for mod in core.scan(self.game)[0]))
+        dialog.reject()
+        dialog.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
