@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
 from core import (APP_VERSION, CACHE_SCHEMA, DATA, Settings, ModError, scan, installed_versions, check_updates,
     apply_cache, write_json, Nexus, InstallPlan, mutation_lock, backup_list, restore_backup,
     ModStatePlan, ModGroups, ModGroupPlan, resolve_group_members, state_companions,
-    validate_game, ensure_stopped, discover_games)
+    validate_game, ensure_stopped, discover_games, hold_desktop_mutex)
 
 STYLE = """
 * { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; color: #253d35; }
@@ -1342,6 +1342,8 @@ def main():
     if not args.render and not lock.tryLock(100):
         QMessageBox.information(None, "星露谷 MOD 管家", "软件已经打开，请在任务栏中切换到它。")
         return 0
+    if not args.render:
+        app._installer_mutex = hold_desktop_mutex()
     try:
         settings = Settings()
     except (OSError, ValueError):

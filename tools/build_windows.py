@@ -43,6 +43,12 @@ def collect_licenses(destination):
     for source in (prefix / "LICENSE_PYTHON.txt", prefix / "LICENSE.txt"):
         if source.is_file():
             shutil.copy2(source, destination / ("Python-" + source.name))
+    if os.environ.get("ISCC"):
+        license_path = Path(os.environ["ISCC"]).parent / "license.txt"
+        if license_path.is_file():
+            folder = destination / "InnoSetup"
+            folder.mkdir(exist_ok=True)
+            shutil.copy2(license_path, folder / "license.txt")
 
 
 def main():
@@ -64,6 +70,10 @@ def main():
         shutil.copy2(ROOT / filename, package / filename)
     shutil.copytree(ROOT / "docs", package / "docs", dirs_exist_ok=True)
     collect_licenses(package / "第三方许可")
+    information = dict(version=APP_VERSION, sources={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+                       for name in ("app.py", "core.py")},
+                       exe_sha256=hashlib.sha256((package / "星露谷MOD管家.exe").read_bytes()).hexdigest())
+    (package / "BUILD_INFO.json").write_text(json.dumps(information, indent=2), encoding="utf-8")
     archive = ROOT / "dist" / f"StardewModSteward-v{APP_VERSION}-windows-x64.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as output:
         for source in sorted(package.rglob("*")):

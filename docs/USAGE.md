@@ -1,5 +1,17 @@
 # 使用教程
 
+## EXE 安装、更新与卸载
+
+1. 从 [发行版](https://github.com/HONGxuanzhao/StardewModSteward/releases/latest) 下载 `StardewModSteward-v1.3.1-windows-x64-Setup.exe`。
+2. 先关闭已运行的管家，再双击安装包，按简体中文向导选择位置及快捷方式。无需安装 Python，默认按当前用户安装。
+3. 通过桌面或开始菜单快捷方式打开；已有的 `%LOCALAPPDATA%\StardewModSteward` 设置和编组会继续使用。
+4. 后续安装新版时仍先关闭管家，再运行新版 Setup。安装器会沿用此前的安装位置。
+5. 在 Windows「设置 → 应用 → 已安装的应用」中找到「星露谷 MOD 管家」卸载。卸载只移除安装的程序文件和快捷方式；设置、编组、下载缓存及游戏 MOD、禁用区、操作备份保留。
+
+便携 ZIP 仍可使用。完整解压后运行里面的 `星露谷MOD管家.exe`，保留 `_internal` 与第三方许可目录；单独复制这个运行 EXE 不包含所需运行库。分享时使用单文件 `Setup.exe` 或完整 ZIP。
+
+从桌面便携版改用安装版时，两者共用当前用户的设置和编组，并受同一实例限制。使用安装版快捷方式启动即可，原便携文件夹可以作为旧版备份保留。
+
 ## 1. 选择正确的 MOD 文件夹
 
 ![自动探测设置，演示路径](images/settings.png)

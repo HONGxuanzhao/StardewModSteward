@@ -21,7 +21,8 @@ from contextlib import contextmanager
 
 import requests
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
+APP_MUTEX = r"Local\StardewModSteward.Desktop"
 CACHE_SCHEMA = 2
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "StardewModSteward"
 HTTP_HEADERS = {"User-Agent": f"StardewModSteward/{APP_VERSION}", "Accept": "application/json"}
@@ -878,6 +879,23 @@ class Nexus:
             raise ModError(f"下载失败（{type(e).__name__}），可稍后重试。") from None
         finally:
             part.unlink(missing_ok=True)
+
+
+def hold_desktop_mutex():
+    """Let Setup detect a running GUI without closing an in-progress MOD job.
+
+    Keep the handle alive for the process lifetime; Windows releases it on exit.
+    The existing QLockFile remains responsible for single-instance behavior.
+    """
+    if os.name != "nt":
+        return None
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel.CreateMutexW(None, False, APP_MUTEX)
+    if not handle:
+        raise ModError("无法创建安装器运行状态标记，请关闭管家后重试。")
+    return handle
 
 
 def game_running():

@@ -23,9 +23,13 @@
 
 ## 直接使用 Windows 版
 
-1. 打开 [Releases](https://github.com/HONGxuanzhao/StardewModSteward/releases/latest)，下载 `StardewModSteward-v1.3.0-windows-x64.zip`。
+推荐下载 [EXE 安装包](https://github.com/HONGxuanzhao/StardewModSteward/releases/download/v1.3.1/StardewModSteward-v1.3.1-windows-x64-Setup.exe)：关闭已打开的管家后双击运行，按向导安装。默认安装在当前用户的 `%LOCALAPPDATA%\Programs\StardewModSteward`，可创建桌面和开始菜单快捷方式，无需单独安装 Python。可在 Windows「设置 → 应用 → 已安装的应用」中卸载；设置、编组与游戏 MOD 会保留。
+
+也可使用便携 ZIP：
+
+1. 打开 [Releases](https://github.com/HONGxuanzhao/StardewModSteward/releases/latest)，下载 `StardewModSteward-v1.3.1-windows-x64.zip`。
 2. **完整解压**到一个可写目录；不要在压缩包内部运行。
-3. 双击 `星露谷MOD管家.exe`。保留 EXE 旁的 `_internal` 文件夹和第三方许可文件。
+3. 双击 `星露谷MOD管家.exe`。保留 EXE 旁的 `_internal` 文件夹和第三方许可文件；这个 EXE 依赖同目录运行库，请勿只拷贝 EXE。
 4. 软件会自动找游戏。没有找到或发现多个安装时，打开「设置 / Nexus 账号」→「自动探测」→选择正确安装，也可以浏览或粘贴目录。
 5. 点击「检查更新」。普通账号下载更新包后拖入窗口；Premium 账号按下文配置后使用「一键更新全部」。
 6. 勾选列表最左侧的「启用」状态可切换 MOD；多选后点击「启用选中」或「禁用选中」。确认窗口发现配套组件时，默认一并调整，请核对完整名单后执行。
@@ -70,6 +74,14 @@ py -3.13 -m venv .venv
 
 构建脚本使用当前 Python 环境的 PyInstaller，输出 `dist\星露谷MOD管家\` 和带版本号的 Windows ZIP。测试数据在临时目录中创建。运行本地程序时，请先退出已打开的另一份管理器实例。
 
+制作 EXE 安装包需安装 [Inno Setup 7](https://jrsoftware.org/isdl.php)，本次使用 7.1.1。编译安装器的同时会先构建完整程序和便携 ZIP：
+
+```powershell
+.\.venv\Scripts\python.exe tools\build_installer.py --iscc 'C:\Program Files\Inno Setup 7\ISCC.exe'
+```
+
+也可用 `ISCC` 环境变量或 PATH 指定编译器。`--skip-build` 只复用已校验为当前版本和源码的程序目录；源码或 EXE 哈希不匹配时会停止。最终输出 `dist\StardewModSteward-v1.3.1-windows-x64-Setup.exe`，以及包含安装版和便携版哈希的 `SHA256SUMS.txt`。
+
 ## 重要规则
 
 - **游戏或 SMAPI 运行时不改动 MOD**。安装或恢复前请退出游戏。
@@ -107,6 +119,8 @@ test_ui.py             基于临时数据的界面测试
 test_mod_state.py      单个/批量启停、依赖、失败回滚和恢复测试
 test_groups.py         编组持久化、必需前置、方案切换与混合事务恢复测试
 tools/build_windows.py Windows 打包及便携包生成
+tools/build_installer.py EXE 安装包构建和版本校验
+tools/windows_installer.iss Inno Setup 安装、快捷方式及卸载配置
 docs/                  使用教程、验证范围和演示截图
 ```
 
