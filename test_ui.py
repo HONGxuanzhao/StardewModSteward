@@ -158,6 +158,85 @@ class UiTests(unittest.TestCase):
         self.assertEqual(self.window.table.item(0, 0).checkState(), Qt.CheckState.Checked)
         self.window.busy = False
 
+    def package_pair(self):
+        for uid, name, dep in (("Test.Code", "Better Balance C#", None), ("Test.Pack", "Better Balance", "Test.Code")):
+            folder = self.game / "Mods" / "Package" / uid
+            folder.mkdir(parents=True)
+            manifest = dict(Name=name, UniqueID=uid, Version="1.0.0", Author="Test author")
+            if dep:
+                manifest["Dependencies"] = [{"UniqueID": dep}]
+            core.write_json(folder / "manifest.json", manifest)
+        self.window.refresh()
+        return next(mod for mod in self.window.mods if mod.uid == "Test.Pack")
+
+    def test_package_confirmation_includes_code_component_by_default(self):
+        pack = self.package_pair()
+        def confirm(box):
+            self.assertTrue(box.checkBox().isChecked())
+            self.assertIn("Better Balance C#", box.informativeText())
+            self.assertIn("2 个 MOD 组件", box.text())
+            return QMessageBox.StandardButton.Yes
+        with patch.object(QMessageBox, "exec", confirm), patch.object(self.window, "run_job") as job:
+            self.window.change_state(False, [pack])
+        folder = job.call_args.args[0](lambda _: None)
+        record = core.json.loads((folder / "transaction.json").read_text(encoding="utf-8"))
+        self.assertEqual({entry["uid"] for entry in record["entries"]}, {"Test.Pack", "Test.Code"})
+
+    def test_package_confirmation_can_explicitly_disable_only_selected_component(self):
+        pack = self.package_pair()
+        def confirm(box):
+            box.checkBox().setChecked(False)
+            self.assertIn("仅调整所选项", box.informativeText())
+            self.assertIn("1 个 MOD 组件", box.text())
+            self.assertNotIn("Test.Code", box.detailedText())
+            return QMessageBox.StandardButton.Yes
+        with patch.object(QMessageBox, "exec", confirm), patch.object(self.window, "run_job") as job:
+            self.window.change_state(False, [pack])
+        job.call_args.args[0](lambda _: None)
+        rows = {m.uid: m for m in core.scan(self.game)[0]}
+        self.assertTrue(rows["Test.Pack"].disabled)
+        self.assertFalse(rows["Test.Code"].disabled)
+
+    def test_package_confirmation_cancel_keeps_both_components(self):
+        pack = self.package_pair()
+        with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Cancel), \
+             patch.object(self.window, "run_job") as job:
+            self.window.change_state(False, [pack])
+        job.assert_not_called()
+        self.assertFalse(any(m.disabled for m in core.scan(self.game)[0]))
+
+    def test_package_details_show_remaining_enabled_code_for_disabled_pack(self):
+        pack = self.package_pair()
+        core.ModStatePlan(self.game, [pack], False).execute()
+        self.window.refresh()
+        row = next(i for i, mod in enumerate(self.window.visible) if mod.uid == "Test.Pack")
+        self.window.table.setCurrentCell(row, 1)
+        self.window.show_details()
+        text = self.window.detail.toPlainText()
+        self.assertIn("配套组件", text)
+        self.assertIn("Better Balance C#（已启用）", text)
+
+    def test_package_confirmation_reenables_all_disabled_components(self):
+        self.package_pair()
+        selected = [mod for mod in self.window.mods if mod.uid in {"Test.Pack", "Test.Code"}]
+        core.ModStatePlan(self.game, selected, False).execute()
+        self.window.refresh()
+        pack = next(mod for mod in self.window.mods if mod.uid == "Test.Pack")
+        with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Yes), \
+             patch.object(self.window, "run_job") as job:
+            self.window.change_state(True, [pack])
+        job.call_args.args[0](lambda _: None)
+        self.assertFalse(any(mod.disabled for mod in core.scan(self.game)[0]))
+
+    def test_running_game_blocks_package_prompt_and_file_changes(self):
+        pack = self.package_pair()
+        with patch("core.game_running", return_value=True), patch.object(self.window, "failed") as failed, \
+             patch.object(QMessageBox, "exec") as prompt, patch.object(self.window, "run_job") as job:
+            self.window.change_state(False, [pack])
+        prompt.assert_not_called()
+        job.assert_not_called()
+        failed.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

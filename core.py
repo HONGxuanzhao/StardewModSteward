@@ -21,7 +21,7 @@ from contextlib import contextmanager
 
 import requests
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 CACHE_SCHEMA = 2
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "StardewModSteward"
 HTTP_HEADERS = {"User-Agent": f"StardewModSteward/{APP_VERSION}", "Accept": "application/json"}
@@ -1127,6 +1127,59 @@ def required_dependencies(mod):
     if mod.manifest.get("ContentPackFor"):
         result.append({**mod.manifest["ContentPackFor"], "IsRequired": True})
     return result
+
+
+def state_companions(game, requested, mods):
+    """Suggest connected components within an original container, never shared frameworks.
+
+    Folder names alone aren't evidence of a package. Require an explicit required
+    dependency and matching nonempty author; disabled rows use their recorded path.
+    Suggestions remain separate from ModStatePlan and require UI confirmation.
+    """
+    game = validate_game(game)
+    roots = {}
+    for mod in mods:
+        try:
+            if mod.disabled:
+                checked_path(game / ".stardew-mod-steward" / "disabled", mod.path)
+                marker = mod.path / ".steward-disabled.json"
+                checked_path(mod.path, marker)
+                if marker.stat().st_size > 65536:
+                    continue
+                record = json.loads(marker.read_text(encoding="utf-8-sig"))
+                relative = record["relative"]
+                if not isinstance(relative, str) or not relative:
+                    continue
+                original = checked_path(game / "Mods", game / "Mods" / relative)
+            else:
+                original = checked_path(game / "Mods", mod.path)
+            parts = original.relative_to(game / "Mods").parts
+            # A MOD directly under Mods has no containing package folder.
+            if len(parts) > 1 and mod.author.strip():
+                roots[str(mod.path).casefold()] = (parts[0].casefold(), mod.author.strip().casefold())
+        except (OSError, ValueError, KeyError, TypeError, ModError):
+            continue
+    chosen = {str(mod.path).casefold() for mod in requested}
+    connected = set(chosen)
+    dependencies = {str(mod.path).casefold(): {dep.get("UniqueID", "").casefold()
+                    for dep in required_dependencies(mod)} for mod in mods}
+    while True:
+        added = set()
+        for mod in mods:
+            key = str(mod.path).casefold()
+            if key in connected or key not in roots:
+                continue
+            for other in mods:
+                other_key = str(other.path).casefold()
+                if other_key not in connected or roots.get(other_key) != roots[key]:
+                    continue
+                if other.uid.casefold() in dependencies[key] or mod.uid.casefold() in dependencies[other_key]:
+                    added.add(key)
+                    break
+        if not added:
+            break
+        connected.update(added)
+    return [mod for mod in mods if str(mod.path).casefold() in connected - chosen]
 
 
 def _state_paths(game, entry):

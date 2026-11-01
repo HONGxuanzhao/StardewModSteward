@@ -16,16 +16,17 @@
 - 从 Nexus Premium 账号自动下载可明确匹配的更新；普通账号在网页下载后，将压缩包拖进窗口安装。
 - 安装前完整备份，默认保留 `config.json`，支持恢复安装批次。
 - 列表中直接勾选启用状态，支持 Ctrl/Shift 多选后批量启用或禁用；提供已启用/已禁用筛选和可撤销的操作记录。
+- 启停时提示同安装文件夹内可识别的配套组件，默认一并调整，避免只禁用内容包而留下 C# 组件；详情可查看各组件状态。
 - 过滤清单中的占位更新键；分别显示单个来源失效、查询失败、主包组件和已安装的已知修复版。
 
 ## 直接使用 Windows 版
 
-1. 打开 [Releases](https://github.com/HONGxuanzhao/StardewModSteward/releases/latest)，下载 `StardewModSteward-v1.2.0-windows-x64.zip`。
+1. 打开 [Releases](https://github.com/HONGxuanzhao/StardewModSteward/releases/latest)，下载 `StardewModSteward-v1.2.1-windows-x64.zip`。
 2. **完整解压**到一个可写目录；不要在压缩包内部运行。
 3. 双击 `星露谷MOD管家.exe`。保留 EXE 旁的 `_internal` 文件夹和第三方许可文件。
 4. 软件会自动找游戏。没有找到或发现多个安装时，打开「设置 / Nexus 账号」→「自动探测」→选择正确安装，也可以浏览或粘贴目录。
 5. 点击「检查更新」。普通账号下载更新包后拖入窗口；Premium 账号按下文配置后使用「一键更新全部」。
-6. 勾选列表最左侧的「启用」状态可切换单个 MOD；多选后点击「启用选中」或「禁用选中」，确认后执行。
+6. 勾选列表最左侧的「启用」状态可切换 MOD；多选后点击「启用选中」或「禁用选中」。确认窗口发现配套组件时，默认一并调整，请核对完整名单后执行。
 
 Windows 包已包含运行环境，**不需要另外安装 Python**。发布版本在 Windows 11 x64 上验证；其他系统未验证。它是未签名的个人工具，不属于 SMAPI、Nexus Mods 或游戏官方产品。
 

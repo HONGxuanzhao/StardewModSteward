@@ -45,6 +45,62 @@ class ModStateTests(unittest.TestCase):
         self.install("Test.Framework")
         self.install("Test.Content", ContentPackFor={"UniqueID": "Test.Framework"})
 
+    def package_pair(self):
+        self.install("Test.Code", "Package/Code", Author="Test author")
+        self.install("Test.Pack", "Package/Pack", Author="Test author",
+                     Dependencies=[{"UniqueID": "Test.Code"}])
+
+    def test_package_companions_require_same_container_author_and_dependency(self):
+        self.package_pair()
+        self.install("Test.Unrelated", "Package/Unrelated", Author="Test author")
+        self.install("Test.External", Author="Test author", Dependencies=[{"UniqueID": "Test.Code"}])
+        rows = self.rows()
+        self.assertEqual([m.uid for m in core.state_companions(self.game, [self.row("Test.Pack")], rows)], ["Test.Code"])
+        self.assertEqual([m.uid for m in core.state_companions(self.game, [self.row("Test.Code")], rows)], ["Test.Pack"])
+
+    def test_package_companions_find_disabled_original_path_in_both_directions(self):
+        self.package_pair()
+        core.ModStatePlan(self.game, [self.row("Test.Pack")], False).execute()
+        self.assertEqual([m.uid for m in core.state_companions(self.game, [self.row("Test.Pack")], self.rows())], ["Test.Code"])
+        core.ModStatePlan(self.game, [self.row("Test.Code")], False).execute()
+        self.assertEqual([m.uid for m in core.state_companions(self.game, [self.row("Test.Code")], self.rows())], ["Test.Pack"])
+
+    def test_package_companions_do_not_include_shared_framework_or_other_author(self):
+        self.package_pair()
+        self.install("Test.Framework", Author="Test author")
+        self.install("Test.Patch", "Package/Patch", Author="Someone else",
+                     Dependencies=[{"UniqueID": "Test.Code"}])
+        pack = self.row("Test.Pack")
+        manifest = dict(pack.manifest, ContentPackFor={"UniqueID": "Test.Framework"})
+        core.write_json(pack.path / "manifest.json", manifest)
+        self.assertEqual([m.uid for m in core.state_companions(self.game, [self.row("Test.Pack")], self.rows())], ["Test.Code"])
+
+    def test_package_companions_do_not_group_top_level_mods(self):
+        self.install("Test.Code", Author="Test author")
+        self.install("Test.Pack", Author="Test author", Dependencies=[{"UniqueID": "Test.Code"}])
+        self.assertEqual(core.state_companions(self.game, [self.row("Test.Pack")], self.rows()), [])
+
+    def test_package_companions_follow_required_chain_and_exclude_selected(self):
+        self.package_pair()
+        self.install("Test.Third", "Package/Sub/Third", Author="Test author",
+                     Dependencies=[{"UniqueID": "Test.Pack"}])
+        selected = [self.row("Test.Code"), self.row("Test.Pack")]
+        self.assertEqual([m.uid for m in core.state_companions(self.game, selected, self.rows())], ["Test.Third"])
+
+    def test_package_companions_ignore_optional_dependency(self):
+        self.package_pair()
+        self.install("Test.Optional", "Package/Optional", Author="Test author",
+                     Dependencies=[{"UniqueID": "Test.Code", "IsRequired": False}])
+        self.assertEqual(core.state_companions(self.game, [self.row("Test.Optional")], self.rows()), [])
+
+    def test_package_companions_skip_invalid_disabled_path_record(self):
+        self.package_pair()
+        core.ModStatePlan(self.game, [self.row("Test.Pack")], False).execute()
+        pack = self.row("Test.Pack")
+        for record in ({"relative": "../../outside/Pack"}, {"relative": None}, {"other": 1}):
+            core.write_json(pack.path / ".steward-disabled.json", record)
+            self.assertEqual(core.state_companions(self.game, [pack], self.rows()), [])
+
     def test_single_disable_enable_preserves_every_byte_and_original_path(self):
         original = self.install("Test.A", folder="Folder with spaces")
         before = {p.name: p.read_bytes() for p in original.iterdir()}

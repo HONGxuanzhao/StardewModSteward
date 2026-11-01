@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
 
 from core import (APP_VERSION, CACHE_SCHEMA, DATA, Settings, ModError, scan, installed_versions, check_updates,
     apply_cache, write_json, Nexus, InstallPlan, mutation_lock, backup_list, restore_backup,
-    ModStatePlan, validate_game, ensure_stopped, discover_games)
+    ModStatePlan, state_companions, validate_game, ensure_stopped, discover_games)
 
 STYLE = """
 * { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; color: #253d35; }
@@ -634,6 +634,11 @@ class Window(QMainWindow):
             return f'<p style="color:#99621d">{esc(text)}</p>'
         body = f'<h2 style="color:#235a3c">{esc(m.name)}</h2><p style="color:#7a8976">{esc(m.author)}</p>'
         body += '<p><b>启用状态</b>　' + ("已禁用" if m.disabled else "已启用") + '</p>'
+        companions = state_companions(self.game, [m], self.mods)
+        if companions:
+            body += '<p><b>配套组件</b><br>' + '<br>'.join(
+                esc(other.name) + ("（已禁用）" if other.disabled else "（已启用）") for other in companions) + '</p>'
+            body += '<p>一个 MOD 可能由多个组件组成；单独禁用此项时，其他组件仍可能被 SMAPI 加载。启停确认窗口可同时调整配套组件。</p>'
         body += f'<p><b>已安装</b>　{esc(m.version)}<br><b>推荐版本</b>　{esc(m.suggestion or "暂无推荐")}</p>'
         body += f'<p>{esc(m.description)}</p><hr><p><b>UniqueID</b><br>{esc(m.uid)}</p>'
         body += f'<p><b>本地目录</b><br>{esc(str(m.path))}</p>'
@@ -919,24 +924,50 @@ class Window(QMainWindow):
         if not chosen:
             return
         try:
-            plan = ModStatePlan(self.game, chosen, enabled)
+            ensure_stopped()
+            companions = [mod for mod in state_companions(self.game, chosen, self.mods)
+                          if mod.disabled == enabled]
         except Exception as exc:
             self.failed(str(exc))
             return
-        if not plan.items:
+        if not any(mod.disabled == enabled for mod in chosen) and not companions:
             QMessageBox.information(self, "无需更改", "所选 MOD 已经是该启用状态。")
             return
         action = "启用" if enabled else "禁用"
         box = QMessageBox(self)
         box.setWindowTitle(action + " MOD")
         box.setIcon(QMessageBox.Icon.Question)
-        box.setText(f"{action}所选的 {len(plan.items)} 个 MOD？")
-        box.setInformativeText("禁用会将完整目录移到专用禁用区，启用时恢复到原位置。已有存档可能依赖这些 MOD。\n\n" + plan.summary()[:1800])
-        box.setDetailedText(plan.summary())
+        include = None
+        if companions:
+            include = QCheckBox(f"同时{action}配套组件（推荐）", box)
+            include.setChecked(True)
+            box.setCheckBox(include)
+        def update_preview():
+            actual = chosen + (companions if include and include.isChecked() else [])
+            actual = [mod for mod in actual if mod.disabled == enabled]
+            summary = "\n".join(f"{action}  {mod.name}  ({mod.uid})" for mod in actual)
+            box.setText(f"{action} {len(actual)} 个 MOD 组件？")
+            note = ""
+            if companions:
+                note = "发现配套组件：" + "、".join(mod.name for mod in companions) + "。\n"
+                if not include.isChecked():
+                    note += "仅调整所选项；其他组件保持原状态，仍可能被 SMAPI 加载。\n"
+            box.setInformativeText(note + "禁用会将完整目录移到专用禁用区，启用时恢复到原位置。已有存档可能依赖这些 MOD。\n\n" + summary[:1800])
+            box.setDetailedText(summary)
+        if include:
+            include.toggled.connect(update_preview)
+        update_preview()
         box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
         box.button(QMessageBox.StandardButton.Yes).setText("确认" + action)
         box.button(QMessageBox.StandardButton.Cancel).setText("取消")
         if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        if include and include.isChecked():
+            chosen.extend(companions)
+        try:
+            plan = ModStatePlan(self.game, chosen, enabled)
+        except Exception as exc:
+            self.failed(str(exc))
             return
         def run(log):
             return plan.execute(log)
