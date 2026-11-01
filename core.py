@@ -21,7 +21,7 @@ from contextlib import contextmanager
 
 import requests
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 CACHE_SCHEMA = 2
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "StardewModSteward"
 HTTP_HEADERS = {"User-Agent": f"StardewModSteward/{APP_VERSION}", "Accept": "application/json"}
@@ -395,10 +395,10 @@ class Mod:
 
     @property
     def status(self):
+        if self.disabled:
+            return "已禁用"
         if self.issues:
             return "需要检查"
-        if self.disabled:
-            return "已停用"
         if self.compatibility in ("Abandoned", "Obsolete"):
             return "停止维护" if self.compatibility == "Abandoned" else "已被替代"
         if self.compatibility in ("Broken", "Unofficial"):
@@ -791,7 +791,7 @@ def game_running():
 
 def ensure_stopped():
     if game_running():
-        raise ModError("请先退出星露谷和 SMAPI，再安装、停用或恢复 MOD。")
+        raise ModError("请先退出星露谷和 SMAPI，再安装、启用、禁用或恢复 MOD。")
 
 
 def validate_member(name):
@@ -1055,10 +1055,15 @@ def backup_list(game):
 
 def ensure_no_pending(game):
     if any(row.get("state") in ("prepared", "recovery_required") for row in backup_list(game)):
-        raise ModError("发现中断的安装，请先在「备份与恢复」中恢复该批次，再进行新的修改。")
+        raise ModError("发现中断的文件操作（安装或启停），请先在「备份与恢复」中恢复该批次，再进行新的修改。")
 
 
 def restore_backup(game, folder, log=lambda _: None):
+    with mutation_lock(game):
+        return _restore_backup_locked(game, folder, log)
+
+
+def _restore_backup_locked(game, folder, log=lambda _: None):
     game = validate_game(game)
     ensure_stopped()
     root = game / ".stardew-mod-steward" / "backups"
@@ -1067,12 +1072,14 @@ def restore_backup(game, folder, log=lambda _: None):
     journal = json.loads(path.read_text(encoding="utf-8"))
     if journal.get("state") not in ("complete", "prepared", "recovery_required"):
         raise ModError("这个备份已经恢复或回滚。")
-    if journal.get("kind") != "install" or journal.get("game", "").casefold() != str(game).casefold():
+    if journal.get("kind") not in ("install", "mod_state") or journal.get("game", "").casefold() != str(game).casefold():
         raise ModError("备份不属于当前游戏。")
     # Restore newest active transaction first, so earlier backups remain meaningful.
     later = [b for b in backup_list(game) if b.get("state") == "complete" and b.get("time", 0) > journal["time"]]
     if later:
         raise ModError("请按时间从新到旧恢复备份。")
+    if journal["kind"] == "mod_state":
+        return _restore_mod_state(game, folder, journal, log)
     actions = []
     for entry in journal["entries"]:
         target = checked_path(game / "Mods", game / entry["target"])
@@ -1115,41 +1122,251 @@ def restore_backup(game, folder, log=lambda _: None):
     return current
 
 
-def toggle_mod(game, mod):
-    game = validate_game(game)
-    ensure_stopped()
-    ensure_no_pending(game)
+def required_dependencies(mod):
+    result = [dep for dep in mod.manifest.get("Dependencies", []) if dep.get("IsRequired", True)]
+    if mod.manifest.get("ContentPackFor"):
+        result.append({**mod.manifest["ContentPackFor"], "IsRequired": True})
+    return result
+
+
+def _state_paths(game, entry):
+    source = checked_path(game, game / entry["source"])
+    destination = checked_path(game, game / entry["destination"])
+    disabled = game / ".stardew-mod-steward" / "disabled"
+    checked_path(disabled if entry["enabled"] else game / "Mods", source)
+    checked_path(game / "Mods" if entry["enabled"] else disabled, destination)
+    return source, destination
+
+
+def _state_marker(folder, encoded):
+    marker = folder / ".steward-disabled.json"
+    checked_path(folder, marker)
+    if encoded is None:
+        marker.unlink(missing_ok=True)
+        return
+    data = base64.b64decode(encoded, validate=True)
+    if len(data) > 65536:
+        raise ModError("启停记录过大，已停止。")
+    temporary = marker.with_name(marker.name + ".tmp-" + uuid.uuid4().hex)
+    try:
+        with temporary.open("xb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _check_state_identity(path, entry):
+    actual = mod_from_manifest(path / "manifest.json")
+    if actual.uid.casefold() != entry["uid"].casefold() or actual.version != entry["version"]:
+        raise ModError("MOD 在操作期间发生变化，请刷新列表后重试：" + entry["name"])
+    assert_plain_tree(path)
+
+
+def _rollback_state_change(game, journal, log=lambda _: None):
+    errors = []
+    for entry in reversed(journal["entries"]):
+        try:
+            source, destination = _state_paths(game, entry)
+            if source.exists() and destination.exists():
+                raise ModError("原目录和目标同时存在，请人工核对，未覆盖任何文件。")
+            if destination.exists():
+                _check_state_identity(destination, entry)
+                source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(destination, source)
+            elif not source.exists():
+                raise ModError("找不到该 MOD 的原目录或目标目录。")
+            _check_state_identity(source, entry)
+            _state_marker(source, entry["marker_before"])
+            log("已恢复原启用状态：" + entry["name"])
+        except Exception as exc:
+            errors.append(entry["name"] + "：" + str(exc))
+    return errors
+
+
+class ModStatePlan:
+    """Validate a single/batch state change against the final dependency graph."""
+    def __init__(self, game, requested, enabled):
+        self.game = validate_game(game)
+        ensure_stopped()
+        ensure_no_pending(self.game)
+        self.enabled = bool(enabled)
+        self.requested = list(requested)
+        self.items = []
+        mods, errors = scan(self.game)
+        if errors:
+            raise ModError("有清单读取错误，请先修复后操作：" + errors[0])
+        disabled = self.game / ".stardew-mod-steward" / "disabled"
+        checked_path(self.game, disabled)
+        seen = set()
+        for old in self.requested:
+            key = str(old.path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            mod = next((m for m in mods if m.path == old.path and m.uid.casefold() == old.uid.casefold()
+                        and m.version == old.version), None)
+            if mod is None or mod.disabled != old.disabled:
+                raise ModError("列表状态已改变，请刷新后重试：" + old.name)
+            if (not mod.disabled) == self.enabled:
+                continue
+            assert_plain_tree(mod.path)
+            if any(other.path != mod.path and (mod.path in other.path.parents or other.path in mod.path.parents)
+                   for other in mods):
+                raise ModError("此 MOD 与其他 MOD 目录嵌套，请先整理独立目录：" + mod.name)
+            marker = mod.path / ".steward-disabled.json"
+            if self.enabled:
+                try:
+                    checked_path(disabled, mod.path)
+                except ModError:
+                    raise ModError("此目录由外部方式隐藏，未保存原路径；请在资源管理器中调整点开头的目录名：" + mod.name)
+                if not marker.is_file() or marker.stat().st_size > 65536:
+                    raise ModError("缺少有效的原目录记录，无法自动启用：" + mod.name)
+                before = marker.read_bytes()
+                try:
+                    record = json.loads(before.decode("utf-8-sig"))
+                    relative = record["relative"]
+                    if not isinstance(relative, str) or not relative:
+                        raise ValueError()
+                except (ValueError, KeyError, TypeError):
+                    raise ModError("原目录记录无效，无法自动启用：" + mod.name)
+                target = checked_path(self.game / "Mods", self.game / "Mods" / relative)
+                after = None
+            else:
+                checked_path(self.game / "Mods", mod.path)
+                if marker.exists():
+                    raise ModError("目录中有遗留的启停记录，请先核对后再操作：" + mod.name)
+                before = None
+                target = disabled / (re.sub(r"[^\w.-]", "_", mod.uid)[:100] + "-" + uuid.uuid4().hex[:8])
+                record = dict(relative=str(mod.path.relative_to(self.game / "Mods")), uid=mod.uid, version=mod.version)
+                after = base64.b64encode(json.dumps(record, ensure_ascii=False).encode("utf-8")).decode("ascii")
+            if target.exists():
+                raise ModError("目标目录已存在，未覆盖任何文件：" + str(target))
+            entry = dict(name=mod.name, uid=mod.uid, version=mod.version, source=str(mod.path.relative_to(self.game)),
+                         destination=str(target.relative_to(self.game)), enabled=self.enabled,
+                         marker_before=base64.b64encode(before).decode("ascii") if before is not None else None,
+                         marker_after=after)
+            _state_paths(self.game, entry)
+            self.items.append(entry)
+        destinations = [str((self.game / e["destination"]).absolute()).casefold() for e in self.items]
+        if len(set(destinations)) != len(destinations):
+            raise ModError("多个 MOD 将写入同一个目录，已停止。")
+        changed_paths = {str(self.game / e["source"]).casefold() for e in self.items}
+        changed_ids = {e["uid"].casefold() for e in self.items}
+        changing = [m for m in mods if str(m.path).casefold() in changed_paths]
+        future = [m for m in mods if not m.disabled and str(m.path).casefold() not in changed_paths]
+        if self.enabled:
+            future.extend(changing)
+        by_id = {}
+        for mod in future:
+            by_id.setdefault(mod.uid.casefold(), []).append(mod)
+        problems = []
+        api, _ = installed_versions(self.game)
+        for mod in changing if self.enabled else []:
+            if len(by_id.get(mod.uid.casefold(), [])) > 1:
+                problems.append(mod.name + "：已有相同 UniqueID 的启用 MOD。")
+            minimum = mod.manifest.get("MinimumApiVersion")
+            if minimum and compare_versions(api, str(minimum)) == -1:
+                problems.append(f"{mod.name}：需要 SMAPI {minimum}。")
+        for mod in future:
+            for dep in required_dependencies(mod):
+                uid = dep.get("UniqueID", "").casefold()
+                # Existing unrelated issues don't block an independent state change.
+                if str(mod.path).casefold() not in changed_paths and uid not in changed_ids:
+                    continue
+                candidates = by_id.get(uid, [])
+                if not candidates:
+                    problems.append(f"{mod.name}：需要启用前置 {dep.get('UniqueID', '?')}。")
+                elif dep.get("MinimumVersion") and not any(compare_versions(m.version, str(dep["MinimumVersion"])) in (0, 1)
+                                                          for m in candidates):
+                    problems.append(f"{mod.name}：前置 {dep['UniqueID']} 需要版本 {dep['MinimumVersion']}。")
+        if problems:
+            action = "启用" if self.enabled else "禁用"
+            raise ModError("无法" + action + "所选 MOD，请将需要同时调整的前置和依赖者一起选择：\n" + "\n".join(dict.fromkeys(problems)))
+
+    def summary(self):
+        action = "启用" if self.enabled else "禁用"
+        return "\n".join(f"{action}  {e['name']}  ({e['uid']})" for e in self.items)
+
+    def execute(self, log=lambda _: None):
+        with mutation_lock(self.game):
+            return ModStatePlan(self.game, self.requested, self.enabled)._execute_locked(log)
+
+    def _execute_locked(self, log):
+        ensure_stopped()
+        ensure_no_pending(self.game)
+        if not self.items:
+            return None
+        state = self.game / ".stardew-mod-steward"
+        folder = checked_path(state, state / "backups" / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]))
+        folder.mkdir(parents=True)
+        journal = dict(kind="mod_state", action="启用" if self.enabled else "禁用", state="prepared",
+                       game=str(self.game), time=time.time(), enabled=self.enabled, entries=self.items)
+        path = folder / "transaction.json"
+        write_json(path, journal)
+        try:
+            for entry in self.items:
+                ensure_stopped()
+                source, destination = _state_paths(self.game, entry)
+                _check_state_identity(source, entry)
+                if destination.exists():
+                    raise ModError("目标目录在准备期间出现，请刷新后重试。")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, destination)
+                _state_marker(destination, entry["marker_after"])
+                write_json(path, journal)
+                log(("已启用：" if self.enabled else "已禁用：") + entry["name"])
+            journal["state"] = "complete"
+            write_json(path, journal)
+            return folder
+        except BaseException:
+            failures = _rollback_state_change(self.game, journal, log)
+            journal["state"] = "recovery_required" if failures else "rolled_back"
+            journal["errors"] = failures
+            write_json(path, journal)
+            if failures:
+                raise ModError("启停操作未完全回滚，请打开「备份与恢复」处理：" + str(folder))
+            raise
+
+
+def _restore_mod_state(game, folder, journal, log):
+    if journal["state"] in ("prepared", "recovery_required"):
+        failures = _rollback_state_change(game, journal, log)
+        journal["errors"] = failures
+        journal["state"] = "recovery_required" if failures else "restored"
+        write_json(folder / "transaction.json", journal)
+        if failures:
+            raise ModError("仍有启停记录需要人工恢复：\n" + "\n".join(failures))
+        return folder
     mods, errors = scan(game)
     if errors:
-        raise ModError("有清单读取错误，请先修复后操作。")
-    state = game / ".stardew-mod-steward"
-    disabled = state / "disabled"
-    checked_path(game, disabled)
-    if mod.disabled:
-        checked_path(disabled, mod.path)
-        # restore the exact original relative path from our disable journal
-        record = mod.path / ".steward-disabled.json"
-        if not record.exists():
-            raise ModError("这不是本软件停用的目录，请在资源管理器中恢复。")
-        info = json.loads(record.read_text(encoding="utf-8"))
-        target = checked_path(game / "Mods", game / "Mods" / info["relative"])
-        if target.exists() or any(m.uid.casefold() == mod.uid.casefold() for m in mods if not m.disabled):
-            raise ModError("启用目标已存在，或已有同 ID 的启用 MOD。")
-    else:
-        checked_path(game / "Mods", mod.path)
-        for other in mods:
-            if other.path != mod.path and (mod.path in other.path.parents or other.path in mod.path.parents):
-                raise ModError("此 MOD 与其他 MOD 嵌套，请先整理独立目录。")
-        disabled.mkdir(parents=True, exist_ok=True)
-        target = disabled / (re.sub(r"[^\w.-]", "_", mod.uid)[:100] + "-" + uuid.uuid4().hex[:8])
-        checked_path(disabled, target)
-        write_json(mod.path / ".steward-disabled.json", {"relative": str(mod.path.relative_to(game / "Mods"))})
-    assert_plain_tree(mod.path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(mod.path, target)
-    if mod.disabled:
-        (target / ".steward-disabled.json").unlink(missing_ok=True)
-    return target
+        raise ModError("有清单读取错误，请先核对后再恢复。")
+    selected = []
+    for entry in journal["entries"]:
+        _, current = _state_paths(game, entry)
+        _check_state_identity(current, entry)
+        mod = next((m for m in mods if m.path == current and m.uid.casefold() == entry["uid"].casefold()), None)
+        if mod is None:
+            raise ModError("找不到该启停批次对应的 MOD：" + entry["name"])
+        selected.append(mod)
+    plan = ModStatePlan(game, selected, not journal["enabled"])
+    result = plan._execute_locked(log)
+    journal["state"] = "restored"
+    journal["restore_time"] = time.time()
+    write_json(folder / "transaction.json", journal)
+    return result or folder
+
+
+def toggle_mod(game, mod):
+    """Compatibility wrapper; all dependency and safety checks now live in the core."""
+    plan = ModStatePlan(game, [mod], mod.disabled)
+    folder = plan.execute()
+    if folder is None:
+        return mod.path
+    journal = json.loads((folder / "transaction.json").read_text(encoding="utf-8"))
+    return plan.game / journal["entries"][0]["destination"]
 
 
 @contextmanager

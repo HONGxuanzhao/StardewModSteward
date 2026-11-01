@@ -5,7 +5,8 @@ import tempfile
 from pathlib import Path
 import unittest
 from unittest.mock import patch
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import Qt, QItemSelectionModel
 import core
 import app
 
@@ -27,6 +28,7 @@ class UiTests(unittest.TestCase):
                                                   "UpdateKeys": ["Nexus:123"]})
         self.patches = [patch("core.installed_versions", return_value=("4.5.2", "1.6.15")),
                         patch("app.installed_versions", return_value=("4.5.2", "1.6.15")),
+                        patch("core.game_running", return_value=False),
                         patch("app.DATA", root / "data")]
         for p in self.patches:
             p.start()
@@ -65,7 +67,7 @@ class UiTests(unittest.TestCase):
                      "version": "2.0.0", "url": "https://www.nexusmods.com/stardewvalley/mods/123"}}}}
         self.window.checked(cache, False)
         self.assertEqual(self.window.counts[1].text(), "1")
-        self.assertEqual(self.window.table.item(0, 2).text(), "2.0.0")
+        self.assertEqual(self.window.table.item(0, 3).text(), "2.0.0")
         self.assertIn("2.0.0", self.window.detail.toPlainText())
 
     def test_settings_lists_detected_mods_path(self):
@@ -82,9 +84,79 @@ class UiTests(unittest.TestCase):
         mod.update = core.prepare_update_result(mod, {"id": mod.uid, "errors": ["Nexus page unavailable"],
             "metadata": {"main": {"version": "1.0.0", "url": "https://www.moddrop.com/stardew-valley/mods/1"}}})
         self.window.populate()
-        self.assertEqual(self.window.table.item(0, 3).text(), "无推荐更新")
-        self.assertEqual(self.window.table.item(0, 4).text(), "ModDrop")
+        self.assertEqual(self.window.table.item(0, 4).text(), "无推荐更新")
+        self.assertEqual(self.window.table.item(0, 5).text(), "ModDrop")
         self.assertIn("Nexus page unavailable", self.window.detail.toPlainText())
+
+    def test_enabled_checkbox_and_explicit_buttons(self):
+        self.assertEqual(self.window.table.item(0, 0).checkState(), Qt.CheckState.Checked)
+        self.assertTrue(self.window.disable_selected.isEnabled())
+        self.assertFalse(self.window.enable_selected.isEnabled())
+        self.assertIn("已启用", self.window.detail.toPlainText())
+        self.window.set_filter("enabled")
+        self.assertEqual(self.window.table.rowCount(), 1)
+
+    def test_checkbox_dispatches_only_clicked_mod_and_reverts_until_commit(self):
+        mod = self.window.mods[0]
+        with patch.object(self.window, "change_state") as change:
+            self.window.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+        change.assert_called_once_with(False, [mod])
+        self.assertEqual(self.window.table.item(0, 0).checkState(), Qt.CheckState.Checked)
+
+    def test_cancelled_disable_keeps_files_and_checkbox(self):
+        original = self.window.mods[0].path
+        with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Cancel), \
+             patch.object(self.window, "run_job") as job:
+            self.window.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+        job.assert_not_called()
+        self.assertTrue(original.exists())
+        self.assertEqual(self.window.table.item(0, 0).checkState(), Qt.CheckState.Checked)
+
+    def test_disabled_filter_and_reenable_button(self):
+        core.ModStatePlan(self.game, self.window.mods, False).execute()
+        self.window.refresh()
+        self.window.set_filter("disabled")
+        self.assertEqual(self.window.table.rowCount(), 1)
+        self.assertEqual(self.window.table.item(0, 0).checkState(), Qt.CheckState.Unchecked)
+        self.assertEqual(self.window.table.item(0, 4).text(), "已禁用")
+        self.assertTrue(self.window.enable_selected.isEnabled())
+        self.assertFalse(self.window.disable_selected.isEnabled())
+        self.window.set_filter("enabled")
+        self.assertEqual(self.window.table.rowCount(), 0)
+
+    def test_multiple_selection_is_preserved_by_search_repopulation(self):
+        extra = self.game / "Mods" / "Second"
+        extra.mkdir()
+        core.write_json(extra / "manifest.json", {"Name": "Second", "UniqueID": "Test.Second", "Version": "1.0.0"})
+        self.window.refresh()
+        self.window.table.selectAll()
+        self.assertEqual(len(self.window.selected_mods()), 2)
+        self.window.populate()
+        self.assertEqual(len(self.window.selected_mods()), 2)
+        self.assertIn("已选 2 项", self.window.selection_label.text())
+
+    def test_confirmed_batch_uses_state_plan_for_all_selected_mods(self):
+        extra = self.game / "Mods" / "Second"
+        extra.mkdir()
+        core.write_json(extra / "manifest.json", {"Name": "Second", "UniqueID": "Test.Second", "Version": "1.0.0"})
+        self.window.refresh()
+        self.window.table.selectAll()
+        with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Yes), \
+             patch.object(self.window, "run_job") as job:
+            self.window.change_state(False)
+        task = job.call_args.args[0]
+        folder = task(lambda _: None)
+        record = core.json.loads((folder / "transaction.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(record["entries"]), 2)
+        self.assertTrue(all(m.disabled for m in core.scan(self.game)[0]))
+
+    def test_busy_worker_prevents_checkbox_mutation(self):
+        self.window.busy = True
+        with patch.object(self.window, "change_state") as change:
+            self.window.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+        change.assert_not_called()
+        self.assertEqual(self.window.table.item(0, 0).checkState(), Qt.CheckState.Checked)
+        self.window.busy = False
 
 
 if __name__ == "__main__":

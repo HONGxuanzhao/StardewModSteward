@@ -11,7 +11,7 @@ import sys
 import time
 import traceback
 
-from PySide6.QtCore import (Qt, QObject, QRunnable, QThreadPool, Signal, QTimer, QUrl, QLockFile)
+from PySide6.QtCore import (Qt, QObject, QRunnable, QThreadPool, Signal, QTimer, QUrl, QLockFile, QItemSelectionModel)
 from PySide6.QtGui import QFont, QColor, QIcon, QDesktopServices, QPainter, QPixmap, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
 
 from core import (APP_VERSION, CACHE_SCHEMA, DATA, Settings, ModError, scan, installed_versions, check_updates,
     apply_cache, write_json, Nexus, InstallPlan, mutation_lock, backup_list, restore_backup,
-    toggle_mod, validate_game, ensure_stopped, discover_games)
+    ModStatePlan, validate_game, ensure_stopped, discover_games)
 
 STYLE = """
 * { font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; color: #253d35; }
@@ -280,6 +280,7 @@ class BackupDialog(QDialog):
             self.table.insertRow(i)
             values = [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["time"])),
                       state_names.get(row["state"], row["state"]),
+                      (row.get("action", "安装") + "：" if row.get("kind") == "mod_state" else "") +
                       "、".join(x["name"] for x in row["entries"])]
             for col, text in enumerate(values):
                 item = QTableWidgetItem(text)
@@ -307,12 +308,12 @@ class BackupDialog(QDialog):
         if chosen["state"] not in ("complete", "prepared", "recovery_required"):
             QMessageBox.information(self, "提示", "此备份已恢复或回滚。")
             return
-        if QMessageBox.question(self, "恢复 MOD", "恢复此批次的原版本？当前版本也会保留在备份目录。") != QMessageBox.StandardButton.Yes:
+        prompt = "撤销此批次的启用 / 禁用操作？会重新检查依赖关系。" if chosen.get("kind") == "mod_state" else "恢复此批次的原版本？当前版本也会保留在备份目录。"
+        if QMessageBox.question(self, "恢复 MOD", prompt) != QMessageBox.StandardButton.Yes:
             return
         game = self.owner.game
         def run(log):
-            with mutation_lock(game):
-                return restore_backup(game, chosen["folder"], log)
+            return restore_backup(game, chosen["folder"], log)
         self.accept()
         self.owner.run_job(run, self.owner.after_install, "正在恢复备份 …")
 
@@ -358,7 +359,8 @@ class Window(QMainWindow):
         sl.addWidget(label("STARDEW MOD STEWARD", "muted"))
         sl.addSpacing(34)
         self.nav = {}
-        for key, title in [("all", "全部 MOD"), ("updates", "可用更新"), ("issues", "需要检查"), ("disabled", "已停用")]:
+        for key, title in [("all", "全部 MOD"), ("enabled", "已启用"), ("disabled", "已禁用"),
+                           ("updates", "可用更新"), ("issues", "需要检查")]:
             b = button(title, lambda checked=False, k=key: self.set_filter(k))
             b.setObjectName("nav")
             b.setCheckable(True)
@@ -397,7 +399,7 @@ class Window(QMainWindow):
         body.addWidget(self.path_label)
         cards = QHBoxLayout()
         self.counts = []
-        for title in ("已识别 MOD", "可用更新", "需要检查", "已停用"):
+        for title in ("已识别 MOD", "可用更新", "需要检查", "已禁用"):
             card = QFrame()
             card.setObjectName("card")
             lay = QHBoxLayout(card)
@@ -423,20 +425,31 @@ class Window(QMainWindow):
             bar.addWidget(b)
             self.actions.append(b)
         body.addLayout(bar)
+        states = QHBoxLayout()
+        states.addWidget(label("启用状态", "subtitle"))
+        self.enable_selected = button("启用选中", lambda: self.change_state(True))
+        self.disable_selected = button("禁用选中", lambda: self.change_state(False))
+        states.addWidget(self.enable_selected)
+        states.addWidget(self.disable_selected)
+        self.actions.extend([self.enable_selected, self.disable_selected])
+        self.selection_label = label("勾选左侧状态可单独切换；Ctrl / Shift 可多选", "muted")
+        states.addWidget(self.selection_label, 1)
+        body.addLayout(states)
         split = QSplitter(Qt.Orientation.Horizontal)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["MOD 名称", "已安装", "推荐版本", "状态", "来源"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col, width in [(1, 100), (2, 100), (3, 110), (4, 95)]:
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["启用", "MOD 名称", "已安装", "推荐版本", "状态", "来源"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col, width in [(0, 58), (2, 90), (3, 90), (4, 110), (5, 85)]:
             self.table.setColumnWidth(col, width)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().hide()
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(False)
         self.table.itemSelectionChanged.connect(self.show_details)
-        self.table.doubleClicked.connect(self.open_mod)
+        self.table.itemChanged.connect(self.state_checkbox_changed)
+        self.table.doubleClicked.connect(lambda index: self.open_mod() if index.column() != 0 else None)
         split.addWidget(self.table)
         detail = QWidget()
         dl = QVBoxLayout(detail)
@@ -454,7 +467,7 @@ class Window(QMainWindow):
         dl.addLayout(row)
         row = QHBoxLayout()
         self.update_one = button("更新此 MOD", self.update_selected, True)
-        self.toggle_button = button("停用", self.toggle)
+        self.toggle_button = button("禁用", self.toggle)
         row.addWidget(self.update_one)
         row.addWidget(self.toggle_button)
         dl.addLayout(row)
@@ -536,12 +549,19 @@ class Window(QMainWindow):
     def populate(self):
         selected = self.selected()
         selected_path = selected.path if selected else None
+        selected_paths = getattr(self, "_state_selection", None)
+        if selected_paths is None:
+            selected_paths = {str(m.path) for m in self.selected_mods()}
+        self._state_selection = None
         totals = [len(self.mods), sum(bool(m.suggestion) for m in self.mods),
                   sum(m.requires_attention for m in self.mods),
                   sum(m.disabled for m in self.mods)]
         for l, n in zip(self.counts, totals):
             l.setText(str(n))
-        for key, text, count in zip(self.nav, ["全部 MOD", "可用更新", "需要检查", "已停用"], totals):
+        navigation = {"all": ("全部 MOD", totals[0]), "updates": ("可用更新", totals[1]),
+                      "issues": ("需要检查", totals[2]), "disabled": ("已禁用", totals[3]),
+                      "enabled": ("已启用", totals[0] - totals[3])}
+        for key, (text, count) in navigation.items():
             self.nav[key].setText(f"{text}    {count}")
         needle = self.search.text().strip().casefold()
         visible = [m for m in self.mods if needle in f"{m.name} {m.author} {m.uid}".casefold()]
@@ -551,27 +571,49 @@ class Window(QMainWindow):
             visible = [m for m in visible if m.requires_attention]
         elif self.filter_name == "disabled":
             visible = [m for m in visible if m.disabled]
+        elif self.filter_name == "enabled":
+            visible = [m for m in visible if not m.disabled]
         self.table.blockSignals(True)
         self.table.setRowCount(len(visible))
         self.visible = visible
         wanted = 0
+        selected_rows = []
         for i, m in enumerate(visible):
+            state = QTableWidgetItem()
+            state.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+            state.setCheckState(Qt.CheckState.Unchecked if m.disabled else Qt.CheckState.Checked)
+            state.setToolTip("点击启用此 MOD" if m.disabled else "点击禁用此 MOD")
+            self.table.setItem(i, 0, state)
             values = [m.name, m.version, m.suggestion or ("见主包" if m.update.get("bundle") else "—"), m.status,
                       m.source_label]
-            for col, text in enumerate(values):
+            for col, text in enumerate(values, 1):
                 item = QTableWidgetItem(text)
-                item.setToolTip(text if col else f"{m.name}\n{m.uid}\n{m.path}")
-                if col == 3:
+                item.setToolTip(text if col != 1 else f"{m.name}\n{m.uid}\n{m.path}")
+                if col == 4:
                     color = "#b27729" if m.requires_attention else "#2c7c43" if m.suggestion else "#798574"
                     item.setForeground(QColor(color))
                 self.table.setItem(i, col, item)
             self.table.setRowHeight(i, 43)
             if m.path == selected_path:
                 wanted = i
-        self.table.blockSignals(False)
+            if str(m.path) in selected_paths:
+                selected_rows.append(i)
+        self.table.clearSelection()
         if visible:
-            self.table.selectRow(wanted)
+            rows = selected_rows or [wanted]
+            for row in rows:
+                self.table.selectionModel().select(self.table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+            self.table.setCurrentCell(wanted if wanted in rows else rows[0], 1,
+                                      QItemSelectionModel.SelectionFlag.NoUpdate)
+        self.table.blockSignals(False)
         self.show_details()
+
+    def selected_mods(self):
+        if not hasattr(self, "visible"):
+            return []
+        return [self.visible[index.row()] for index in sorted(self.table.selectionModel().selectedRows(), key=lambda i: i.row())
+                if 0 <= index.row() < len(self.visible)]
 
     def selected(self):
         row = self.table.currentRow()
@@ -579,6 +621,11 @@ class Window(QMainWindow):
 
     def show_details(self):
         m = self.selected()
+        chosen = self.selected_mods()
+        self.enable_selected.setEnabled(not self.busy and any(mod.disabled for mod in chosen))
+        self.disable_selected.setEnabled(not self.busy and any(not mod.disabled for mod in chosen))
+        self.toggle_button.setEnabled(not self.busy and m is not None)
+        self.selection_label.setText(f"已选 {len(chosen)} 项 · 勾选状态可单独切换，Ctrl / Shift 可多选")
         if not m:
             self.detail.setHtml("<h3>选择一个 MOD</h3><p>查看版本、来源和依赖关系。</p>")
             return
@@ -586,6 +633,7 @@ class Window(QMainWindow):
         def tag(text):
             return f'<p style="color:#99621d">{esc(text)}</p>'
         body = f'<h2 style="color:#235a3c">{esc(m.name)}</h2><p style="color:#7a8976">{esc(m.author)}</p>'
+        body += '<p><b>启用状态</b>　' + ("已禁用" if m.disabled else "已启用") + '</p>'
         body += f'<p><b>已安装</b>　{esc(m.version)}<br><b>推荐版本</b>　{esc(m.suggestion or "暂无推荐")}</p>'
         body += f'<p>{esc(m.description)}</p><hr><p><b>UniqueID</b><br>{esc(m.uid)}</p>'
         body += f'<p><b>本地目录</b><br>{esc(str(m.path))}</p>'
@@ -623,7 +671,7 @@ class Window(QMainWindow):
             body += tag("官方版本存在兼容性问题，请核对是否已使用适配当前游戏的非官方修复版。")
         body += '<p style="color:#8b9585;font-size:11px">更新结果来自 SMAPI 公共接口。无推荐更新不代表已经验证游戏内兼容性。</p>'
         self.detail.setHtml(body)
-        self.toggle_button.setText("启用" if m.disabled else "停用")
+        self.toggle_button.setText("启用" if m.disabled else "禁用")
         self.update_one.setText(("核对网页" if m.update["bundle"].get("mode") == "web" else "更新主包")
                                if m.update.get("bundle") else "更新此 MOD")
 
@@ -631,6 +679,7 @@ class Window(QMainWindow):
         if self.busy:
             return
         self.busy = True
+        self.table.setEnabled(False)
         for b in self.actions:
             b.setEnabled(False)
         self.progress.setRange(0, 0)
@@ -647,10 +696,12 @@ class Window(QMainWindow):
     def finish_job(self, job):
         self.jobs.discard(job)
         self.busy = False
+        self.table.setEnabled(True)
         for b in self.actions:
             b.setEnabled(True)
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
+        self.show_details()
 
     def failed(self, message):
         self.log("未完成：" + message)
@@ -850,28 +901,58 @@ class Window(QMainWindow):
             return game
         self.run_job(run, lambda _: QTimer.singleShot(100, self.refresh), "正在连接 Nexus 并准备更新 …")
 
+    def state_checkbox_changed(self, item):
+        if item.column() != 0 or not 0 <= item.row() < len(self.visible):
+            return
+        mod = self.visible[item.row()]
+        enabled = item.checkState() == Qt.CheckState.Checked
+        self.table.blockSignals(True)
+        item.setCheckState(Qt.CheckState.Unchecked if mod.disabled else Qt.CheckState.Checked)
+        self.table.blockSignals(False)
+        if not self.busy and enabled == mod.disabled:
+            self.change_state(enabled, [mod])
+
+    def change_state(self, enabled, mods=None):
+        if self.busy:
+            return
+        chosen = list(mods) if mods is not None else self.selected_mods()
+        if not chosen:
+            return
+        try:
+            plan = ModStatePlan(self.game, chosen, enabled)
+        except Exception as exc:
+            self.failed(str(exc))
+            return
+        if not plan.items:
+            QMessageBox.information(self, "无需更改", "所选 MOD 已经是该启用状态。")
+            return
+        action = "启用" if enabled else "禁用"
+        box = QMessageBox(self)
+        box.setWindowTitle(action + " MOD")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"{action}所选的 {len(plan.items)} 个 MOD？")
+        box.setInformativeText("禁用会将完整目录移到专用禁用区，启用时恢复到原位置。已有存档可能依赖这些 MOD。\n\n" + plan.summary()[:1800])
+        box.setDetailedText(plan.summary())
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        box.button(QMessageBox.StandardButton.Yes).setText("确认" + action)
+        box.button(QMessageBox.StandardButton.Cancel).setText("取消")
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        def run(log):
+            return plan.execute(log)
+        self.run_job(run, self.after_state_change, "正在" + action + " MOD …")
+
+    def after_state_change(self, folder):
+        if folder:
+            record = json.loads((Path(folder) / "transaction.json").read_text(encoding="utf-8"))
+            self._state_selection = {str(Path(self.game) / e["destination"]) for e in record["entries"]}
+            self.log(f"{record['action']}完成：{len(record['entries'])} 个 MOD。可在「备份与恢复」撤销。")
+        QTimer.singleShot(100, self.refresh)
+
     def toggle(self):
         mod = self.selected()
-        if not mod or self.busy:
-            return
-        if not mod.disabled:
-            dependent = [m.name for m in self.mods if not m.disabled and m is not mod and
-                         any(d.get("UniqueID", "").casefold() == mod.uid.casefold() and d.get("IsRequired", True)
-                             for d in list(m.manifest.get("Dependencies", [])) +
-                             ([m.manifest["ContentPackFor"]] if m.manifest.get("ContentPackFor") else []))]
-            if dependent:
-                QMessageBox.warning(self, "仍有 MOD 依赖它", "请先处理这些依赖它的 MOD：\n" + "\n".join(dependent))
-                return
-        text = ("启用" if mod.disabled else "停用") + mod.name + "？"
-        if not mod.disabled:
-            text += "\n停用会将目录移动到游戏目录下的专用停用区。已有存档可能依赖此 MOD。"
-        if QMessageBox.question(self, "调整启用状态", text) != QMessageBox.StandardButton.Yes:
-            return
-        game = self.game
-        def run(log):
-            with mutation_lock(game):
-                return toggle_mod(game, mod)
-        self.run_job(run, self.after_install, "正在调整启用状态 …")
+        if mod:
+            self.change_state(mod.disabled, [mod])
 
     def dragEnterEvent(self, event):
         if not self.busy and event.mimeData().hasUrls():

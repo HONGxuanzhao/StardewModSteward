@@ -15,16 +15,17 @@
 - 无需 Nexus API Key 即可检查推荐更新。
 - 从 Nexus Premium 账号自动下载可明确匹配的更新；普通账号在网页下载后，将压缩包拖进窗口安装。
 - 安装前完整备份，默认保留 `config.json`，支持恢复安装批次。
-- 启用/停用 MOD；发现重复 ID、目录嵌套、缺少前置或游戏正在运行时，给出具体提示。
+- 列表中直接勾选启用状态，支持 Ctrl/Shift 多选后批量启用或禁用；提供已启用/已禁用筛选和可撤销的操作记录。
 - 过滤清单中的占位更新键；分别显示单个来源失效、查询失败、主包组件和已安装的已知修复版。
 
 ## 直接使用 Windows 版
 
-1. 打开 [Releases](https://github.com/HONGxuanzhao/StardewModSteward/releases/latest)，下载 `StardewModSteward-v1.1.0-windows-x64.zip`。
+1. 打开 [Releases](https://github.com/HONGxuanzhao/StardewModSteward/releases/latest)，下载 `StardewModSteward-v1.2.0-windows-x64.zip`。
 2. **完整解压**到一个可写目录；不要在压缩包内部运行。
 3. 双击 `星露谷MOD管家.exe`。保留 EXE 旁的 `_internal` 文件夹和第三方许可文件。
 4. 软件会自动找游戏。没有找到或发现多个安装时，打开「设置 / Nexus 账号」→「自动探测」→选择正确安装，也可以浏览或粘贴目录。
 5. 点击「检查更新」。普通账号下载更新包后拖入窗口；Premium 账号按下文配置后使用「一键更新全部」。
+6. 勾选列表最左侧的「启用」状态可切换单个 MOD；多选后点击「启用选中」或「禁用选中」，确认后执行。
 
 Windows 包已包含运行环境，**不需要另外安装 Python**。发布版本在 Windows 11 x64 上验证；其他系统未验证。它是未签名的个人工具，不属于 SMAPI、Nexus Mods 或游戏官方产品。
 
@@ -59,15 +60,17 @@ py -3.13 -m venv .venv
 ### 测试与打包
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest -v test_core test_ui
+.\.venv\Scripts\python.exe -m unittest -v test_core test_ui test_mod_state
 .\.venv\Scripts\python.exe tools\build_windows.py
 ```
 
-构建脚本使用当前 Python 环境的 PyInstaller，输出 `dist\StardewModSteward\` 和带版本号的 Windows ZIP。测试数据在临时目录中创建。运行本地程序时，请先退出已打开的另一份管理器实例。
+构建脚本使用当前 Python 环境的 PyInstaller，输出 `dist\星露谷MOD管家\` 和带版本号的 Windows ZIP。测试数据在临时目录中创建。运行本地程序时，请先退出已打开的另一份管理器实例。
 
 ## 重要规则
 
 - **游戏或 SMAPI 运行时不改动 MOD**。安装或恢复前请退出游戏。
+- 禁用会把整个 MOD 目录移至专用禁用区，启用时恢复原路径，代码、素材和配置均保留。批量启停按整组操作后的依赖关系校验；不能单独禁用仍被需要的前置，也不能启用缺少前置的内容包。
+- 启停批次可以在「备份与恢复」撤销，中途失败会尝试恢复原状态；进程意外退出后的未完成批次也可从这里恢复。目录嵌套、原路径冲突或被外部方式隐藏但缺少记录的目录会提示人工核对。
 - 自动更新只选择版本与 SMAPI 推荐一致、subkey 匹配且唯一的 Nexus MAIN 主文件；多个候选、额外新 MOD、前置缺失和目录边界不明确时会跳过，并说明原因。
 - MOD 用 UniqueID 匹配，不根据压缩包名字猜测覆盖位置。原目录完整备份，新包替换代码和素材；默认仅继承已有 `config.json`。其他自行修改可在备份中找回。
 - 不自动安装 SMAPI 本体、没有 `manifest.json` 的原文件覆盖包或相互嵌套的 MOD 根目录。
@@ -83,7 +86,7 @@ py -3.13 -m venv .venv
 | 设置、检查缓存、日志 | `%LOCALAPPDATA%\StardewModSteward` |
 | 已下载更新包 | `%LOCALAPPDATA%\StardewModSteward\downloads` |
 | 完整安装备份和事务记录 | `游戏目录\.stardew-mod-steward\backups` |
-| 停用的 MOD | `游戏目录\.stardew-mod-steward\disabled` |
+| 禁用的 MOD | `游戏目录\.stardew-mod-steward\disabled` |
 
 Nexus API Key 使用当前 Windows 用户的 DPAPI 加密。检查更新会向 SMAPI.io 发送 MOD ID、更新键、版本、游戏/SMAPI 版本与平台；密钥只用于 Nexus 官方 API，不上传存档、MOD 文件内容或本机日志。完整使用与恢复方法见 [教程](docs/USAGE.md)。
 
@@ -94,6 +97,7 @@ app.py                 中文 Qt 界面、后台任务及操作入口
 core.py                自动发现、清单扫描、更新检查、Nexus 下载、安装与恢复
 test_core.py           核心逻辑与文件安全回归测试
 test_ui.py             基于临时数据的界面测试
+test_mod_state.py      单个/批量启停、依赖、失败回滚和恢复测试
 tools/build_windows.py Windows 打包及便携包生成
 docs/                  使用教程、验证范围和演示截图
 ```
